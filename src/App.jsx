@@ -41,10 +41,14 @@ const ACTIVITY_HEURISTICS = {
 
 };
 
+const DEFAULT_SEGMENT_GAP_MINUTES = 8;
+
 export default function App() {
   const [sessions, setSessions] = useState([]);
   const rebuildSeqRef = useRef({}); // id -> seq (invalida cálculos viejos)
   const geoCacheRef = useRef(new Map()); // "lat,lon" -> nombre de lugar
+  const sessionsRef = useRef([]);
+  useEffect(() => { sessionsRef.current = sessions; }, [sessions]);
 
   function onInputFiles(e) {
     const files = Array.from(e.target.files || []);
@@ -72,26 +76,31 @@ export default function App() {
       const activityType = classifyActivity(stats);
       const activityNote = deriveClassificationNote(stats, activityType);
       const center = centerOfPoints(points);
-      const bounds = boundsOfPoints(points, 0.00045);
+      const overallBounds = boundsOfPoints(points, 0.00045);
 
       const params = { gamma: 0.7, sigma: 7, threshold: 0.05, res: 1000 };
-      const overlayUrl = await buildOverlay(points, bounds, params);
+      const segments = await buildSegments(points, params, DEFAULT_SEGMENT_GAP_MINUTES);
+      const firstSegment = segments[0] || null;
 
       const id = `${file.name}-${Date.now()}`;
+      rebuildSeqRef.current[id] = { segments: {}, splitSeq: 0 };
       setSessions((prev) => [
         {
           id,
           fileName: file.name,
           startTime,
           center,
-          bounds,
+          bounds: firstSegment?.bounds || overallBounds,
           params,
           points,
-          overlayUrl,
+          overlayUrl: firstSegment?.overlayUrl || null,
           place: "Buscando lugar…",
           stats,
           activityType,
           activityNote,
+          segments,
+          activeSegmentIndex: 0,
+          segmentGapMinutes: DEFAULT_SEGMENT_GAP_MINUTES,
         },
         ...prev,
       ]);
@@ -111,15 +120,114 @@ export default function App() {
     });
   }
 
-  function scheduleOverlayRebuild(id, nextSessions) {
-    const sess = nextSessions.find((s) => s.id === id);
+  function scheduleOverlayRebuild(id, nextSessions, forcedSegmentIndex) {
+    const source = nextSessions || sessionsRef.current;
+    const sess = source.find((s) => s.id === id);
     if (!sess) return;
-    const seq = (rebuildSeqRef.current[id] || 0) + 1;
-    rebuildSeqRef.current[id] = seq;
-    buildOverlay(sess.points, sess.bounds, sess.params).then((url) => {
-      if (rebuildSeqRef.current[id] !== seq) return; // resultado viejo
-      setSessions((cur) => cur.map((s) => (s.id === id ? { ...s, overlayUrl: url } : s)));
+    const segIdx = typeof forcedSegmentIndex === "number" ? forcedSegmentIndex : (sess.activeSegmentIndex ?? 0);
+    const segment = sess.segments?.[segIdx];
+    if (!segment) return;
+
+    const prevEntry = rebuildSeqRef.current[id] || { segments: {}, splitSeq: 0 };
+    const prevSegments = prevEntry.segments || {};
+    const segSeq = (prevSegments[segIdx] || 0) + 1;
+    rebuildSeqRef.current[id] = { ...prevEntry, segments: { ...prevSegments, [segIdx]: segSeq } };
+
+    buildOverlay(segment.points, segment.bounds, sess.params).then((url) => {
+      const currentEntry = rebuildSeqRef.current[id];
+      if (!currentEntry || currentEntry.segments?.[segIdx] !== segSeq) return; // resultado viejo
+      setSessions((cur) =>
+        cur.map((s) => {
+          if (s.id !== id) return s;
+          const updatedSegments = s.segments.map((seg, idx) =>
+            idx === segIdx ? { ...seg, overlayUrl: url, params: { ...s.params } } : seg
+          );
+          const patch = { segments: updatedSegments };
+          if (segIdx === s.activeSegmentIndex) {
+            patch.overlayUrl = url;
+            patch.bounds = updatedSegments[segIdx].bounds;
+          }
+          return { ...s, ...patch };
+        })
+      );
     });
+  }
+
+  function setActiveSegment(id, index) {
+    const session = sessionsRef.current.find((s) => s.id === id);
+    if (!session) return;
+    const segCount = session.segments?.length || 0;
+    if (segCount === 0) return;
+    const nextIndex = clamp(Number(index), 0, Math.max(0, segCount - 1));
+    const target = session.segments[nextIndex];
+    if (!target) return;
+    if (
+      session.activeSegmentIndex !== nextIndex ||
+      session.bounds !== target.bounds ||
+      session.overlayUrl !== target.overlayUrl
+    ) {
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.id === id
+            ? { ...s, activeSegmentIndex: nextIndex, bounds: target.bounds, overlayUrl: target.overlayUrl }
+            : s
+        )
+      );
+    }
+    if (!areParamsEqual(target.params, session.params) || !target.overlayUrl) {
+      scheduleOverlayRebuild(id, null, nextIndex);
+    }
+  }
+
+  async function updateSegmentGap(id, gapMinutes) {
+    const session = sessionsRef.current.find((s) => s.id === id);
+    if (!session) return;
+    const numericGap = Number.isFinite(Number(gapMinutes)) ? Number(gapMinutes) : (session.segmentGapMinutes ?? DEFAULT_SEGMENT_GAP_MINUTES);
+    const safeValue = Math.round(clamp(numericGap, 1, 60));
+    if (safeValue === session.segmentGapMinutes) return;
+    const entry = rebuildSeqRef.current[id] || { segments: {}, splitSeq: 0 };
+    const splitSeq = (entry.splitSeq || 0) + 1;
+    rebuildSeqRef.current[id] = { segments: {}, splitSeq };
+    const newSegments = await buildSegments(session.points, session.params, safeValue);
+    if ((rebuildSeqRef.current[id]?.splitSeq ?? 0) !== splitSeq) return;
+    const nextIndex = Math.min(session.activeSegmentIndex ?? 0, Math.max(0, newSegments.length - 1));
+    const activeSegment = newSegments[nextIndex] || null;
+    setSessions((prev) =>
+      prev.map((s) => {
+        if (s.id !== id) return s;
+        return {
+          ...s,
+          segmentGapMinutes: safeValue,
+          segments: newSegments,
+          activeSegmentIndex: nextIndex,
+          bounds: activeSegment?.bounds || s.bounds,
+          overlayUrl: activeSegment?.overlayUrl || null,
+        };
+      })
+    );
+  }
+
+  async function mergeSegments(id) {
+    const session = sessionsRef.current.find((s) => s.id === id);
+    if (!session) return;
+    const entry = rebuildSeqRef.current[id] || { segments: {}, splitSeq: 0 };
+    const splitSeq = (entry.splitSeq || 0) + 1;
+    rebuildSeqRef.current[id] = { segments: {}, splitSeq };
+    const mergedSegments = await buildSegments(session.points, session.params, Infinity);
+    if ((rebuildSeqRef.current[id]?.splitSeq ?? 0) !== splitSeq) return;
+    const activeSegment = mergedSegments[0] || null;
+    setSessions((prev) =>
+      prev.map((s) => {
+        if (s.id !== id) return s;
+        return {
+          ...s,
+          segments: mergedSegments,
+          activeSegmentIndex: 0,
+          bounds: activeSegment?.bounds || s.bounds,
+          overlayUrl: activeSegment?.overlayUrl || null,
+        };
+      })
+    );
   }
 
   async function resolvePlaceName(id, center) {
@@ -171,7 +279,14 @@ export default function App() {
 
         <div className="sessionList">
           {sessions.map((s) => (
-            <SessionBlock key={s.id} session={s} onChangeParams={updateParams} />
+            <SessionBlock
+              key={s.id}
+              session={s}
+              onChangeParams={updateParams}
+              onSelectSegment={setActiveSegment}
+              onChangeGap={updateSegmentGap}
+              onMergeSegments={mergeSegments}
+            />
           ))}
         </div>
       </main>
@@ -188,10 +303,29 @@ function EmptyState() {
   );
 }
 
-function SessionBlock({ session, onChangeParams }) {
-  const { id, fileName, startTime, place, bounds, params, overlayUrl, stats, activityType, activityNote } = session;
+function SessionBlock({ session, onChangeParams, onSelectSegment, onChangeGap, onMergeSegments }) {
+  const {
+    id,
+    fileName,
+    startTime,
+    place,
+    bounds,
+    params,
+    overlayUrl,
+    stats,
+    activityType,
+    activityNote,
+    segments = [],
+    activeSegmentIndex = 0,
+    segmentGapMinutes = DEFAULT_SEGMENT_GAP_MINUTES,
+  } = session;
   const title = `${formatDateTime(startTime)} · ${place || "Ubicación desconocida"} · ${fileName}`;
   const activityMeta = ACTIVITY_META[activityType] || { label: "Actividad", emoji: "❓", className: "unknown" };
+  const segmentCount = segments.length || 0;
+  const activeSegment = segments[activeSegmentIndex] || segments[0] || null;
+  const mapBounds = activeSegment?.bounds || bounds;
+  const mapOverlayUrl = activeSegment?.overlayUrl || overlayUrl;
+  const segmentLabel = segmentCount > 1 ? `${segmentCount} segmentos detectados` : "Sin cortes detectados";
 
   return (
     <details open className="card session">
@@ -208,6 +342,43 @@ function SessionBlock({ session, onChangeParams }) {
 
       <div className="session__content">
         <div className="controls">
+          <div className="segmentSelector">
+            <div className="segmentSelector__info">
+              <div className="segmentSelector__label">Segmentos</div>
+              <div className="segmentSelector__meta">{segmentLabel}</div>
+            </div>
+            {segmentCount > 1 ? (
+              <select
+                className="segmentSelector__select"
+                value={activeSegmentIndex}
+                onChange={(e) => onSelectSegment(id, Number(e.target.value))}
+              >
+                {segments.map((_, idx) => (
+                  <option key={idx} value={idx}>{`${idx + 1}ª parte`}</option>
+                ))}
+              </select>
+            ) : (
+              <span className="segmentSelector__single">Recorrido completo</span>
+            )}
+            <button
+              type="button"
+              className="segmentSelector__merge"
+              onClick={() => onMergeSegments(id)}
+              disabled={segmentCount <= 1}
+              title={segmentCount <= 1 ? "No hay cortes que fusionar" : "Combina todos los tramos en uno solo"}
+            >
+              Fusionar segmentos
+            </button>
+          </div>
+          <ControlNumber
+            label="Corte (min sin puntos)"
+            help="Umbral para detectar cortes largos sin actividad."
+            min={1}
+            max={60}
+            step={1}
+            value={segmentGapMinutes}
+            onChange={(v) => onChangeGap(id, Math.round(v))}
+          />
           <div className={`activityCard activityCard--${activityMeta.className}`}>
             <div className="activityCard__header">Actividad estimada</div>
             <div className="activityCard__value">{activityMeta.emoji} {activityMeta.label}</div>
@@ -245,7 +416,7 @@ function SessionBlock({ session, onChangeParams }) {
           <p className="help">Consejo: si movés mucho los parámetros, subí la resolución para un borde más suave.</p>
         </div>
         <div className="mapWrap">
-          <LeafletMap bounds={bounds} overlayUrl={overlayUrl} />
+          <LeafletMap bounds={mapBounds} overlayUrl={mapOverlayUrl} />
         </div>
       </div>
     </details>
@@ -253,11 +424,13 @@ function SessionBlock({ session, onChangeParams }) {
 }
 
 function ControlNumber({ label, help, value, onChange, min, max, step }) {
+  const decimals = typeof step === "number" ? (step >= 1 ? 0 : step >= 0.1 ? 1 : 3) : 3;
+  const displayValue = typeof value === "number" ? value.toFixed(decimals) : value;
   return (
     <div className="control">
       <div className="control__row">
         <span className="control__label">{label}</span>
-        <span className="control__value">{typeof value === "number" ? value.toFixed(3) : value}</span>
+        <span className="control__value">{displayValue}</span>
       </div>
       {help && <div className="control__help">{help}</div>}
       <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(parseFloat(e.target.value))} className="slider" />
@@ -330,6 +503,62 @@ function parseGPX(xmlText) {
 
   const startTime = pts.find((p) => p.time)?.time || doc.getElementsByTagName("time")[0]?.textContent || null;
   return { points: pts, startTime };
+}
+
+function splitTrack(points, gapMinutes = DEFAULT_SEGMENT_GAP_MINUTES) {
+  if (!Array.isArray(points) || points.length === 0) return [];
+  const normalizedGap = Number.isFinite(gapMinutes) && gapMinutes > 0 ? gapMinutes : Infinity;
+  const gapMs = normalizedGap * 60_000;
+  const segments = [];
+  let current = [];
+  let lastTime = null;
+
+  for (const point of points) {
+    const timeValue = point.time ? Date.parse(point.time) : NaN;
+    let shouldSplit = false;
+    if (current.length > 0 && Number.isFinite(timeValue) && Number.isFinite(lastTime)) {
+      if (timeValue < lastTime) {
+        shouldSplit = true;
+      } else if (timeValue - lastTime > gapMs) {
+        shouldSplit = true;
+      }
+    }
+
+    if (shouldSplit) {
+      segments.push(current);
+      current = [];
+    }
+
+    current.push(point);
+    if (Number.isFinite(timeValue)) lastTime = timeValue;
+  }
+
+  if (current.length) segments.push(current);
+  return segments.length ? segments : [points];
+}
+
+async function buildSegments(points, params, gapMinutes) {
+  const groups = splitTrack(points, gapMinutes);
+  if (!groups.length) return [];
+  const segments = await Promise.all(
+    groups.map(async (segmentPoints) => {
+      const segBounds = boundsOfPoints(segmentPoints, 0.00045);
+      const overlayUrl = await buildOverlay(segmentPoints, segBounds, params);
+      return {
+        points: segmentPoints,
+        bounds: segBounds,
+        overlayUrl,
+        params: { ...params },
+      };
+    })
+  );
+  return segments;
+}
+
+function areParamsEqual(a, b) {
+  if (!a || !b) return false;
+  const keys = ["gamma", "sigma", "threshold", "res"];
+  return keys.every((key) => (a[key] ?? null) === (b[key] ?? null));
 }
 
 function computeTrackStats(points) {
@@ -782,8 +1011,21 @@ function Style() {
       .session__activityTag--unknown{background:#e5e7eb; color:#374151}
       .session__chev{color:var(--muted)}
       .session__content{display:grid; grid-template-columns: 1fr 1.2fr; gap:12px; padding:12px;}
-      @media (max-width:900px){ .session__content{grid-template-columns:1fr} }
+      @media (max-width:900px){
+        .session__content{grid-template-columns:1fr}
+        .segmentSelector{flex-direction:column; align-items:stretch;}
+        .segmentSelector__merge{width:100%;}
+      }
       .controls{display:flex; flex-direction:column; gap:10px}
+      .segmentSelector{display:flex; flex-wrap:wrap; align-items:center; gap:8px; border:1px solid var(--line); border-radius:12px; padding:10px; background:#fff;}
+      .segmentSelector__info{flex:1 1 160px; display:flex; flex-direction:column; gap:2px;}
+      .segmentSelector__label{font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted);}
+      .segmentSelector__meta{font-size:12px; color:var(--muted);}
+      .segmentSelector__select{flex:1 1 150px; border:1px solid var(--line); border-radius:8px; padding:6px 10px; background:#fff; font-size:13px;}
+      .segmentSelector__single{font-size:13px; color:var(--muted);}
+      .segmentSelector__merge{flex:0 0 auto; display:inline-flex; align-items:center; justify-content:center; gap:4px; padding:6px 12px; border-radius:10px; border:1px solid var(--line); background:#fff; color:var(--fg); cursor:pointer; font-size:12px; font-weight:500;}
+      .segmentSelector__merge:hover{background:#f4f4f5;}
+      .segmentSelector__merge:disabled{cursor:default; opacity:0.6; background:#fafafa;}
       .activityCard{border:1px solid var(--line); border-radius:12px; padding:12px; background:#fafafa; display:flex; flex-direction:column; gap:8px}
       .activityCard__header{font-size:12px; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted); margin:0}
       .activityCard__value{font-weight:700; font-size:18px}
