@@ -15,6 +15,20 @@ import "leaflet/dist/leaflet.css";
  * - Tests DEV activables con `?devtests=1` (sin `import.meta.env`).
  */
 
+const ACTIVITY_META = {
+  running: { label: "Running", emoji: "🏃", className: "running" },
+  futbol: { label: "Fútbol", emoji: "⚽", className: "futbol" },
+  bici: { label: "Bici", emoji: "🚴", className: "bici" },
+};
+
+// Heurísticas base para clasificar actividades según el patrón de movimiento.
+// Se documenta explícitamente para poder afinarlas o exponerlas en sliders a futuro.
+const ACTIVITY_HEURISTICS = {
+  futbol: { maxDistanceKm: 5, maxSpanKm: 0.2 },
+  bici: { minAvgSpeedKmh: 18, minMaxSpeedKmh: 28 },
+  running: { maxAvgSpeedKmh: 12, maxSpanKm: 0.3 },
+};
+
 export default function App() {
   const [sessions, setSessions] = useState([]);
   const rebuildSeqRef = useRef({}); // id -> seq (invalida cálculos viejos)
@@ -42,6 +56,9 @@ export default function App() {
       if (!parsed.points.length) continue;
 
       const { points, startTime } = parsed;
+      const stats = computeTrackStats(points);
+      const activityType = classifyActivity(stats);
+      const activityNote = deriveClassificationNote(stats, activityType);
       const center = centerOfPoints(points);
       const bounds = boundsOfPoints(points, 0.00045);
 
@@ -50,7 +67,20 @@ export default function App() {
 
       const id = `${file.name}-${Date.now()}`;
       setSessions((prev) => [
-        { id, fileName: file.name, startTime, center, bounds, params, points, overlayUrl, place: "Buscando lugar…" },
+        {
+          id,
+          fileName: file.name,
+          startTime,
+          center,
+          bounds,
+          params,
+          points,
+          overlayUrl,
+          place: "Buscando lugar…",
+          stats,
+          activityType,
+          activityNote,
+        },
         ...prev,
       ]);
 
@@ -147,18 +177,54 @@ function EmptyState() {
 }
 
 function SessionBlock({ session, onChangeParams }) {
-  const { id, fileName, startTime, place, bounds, params, overlayUrl } = session;
+  const { id, fileName, startTime, place, bounds, params, overlayUrl, stats, activityType, activityNote } = session;
   const title = `${formatDateTime(startTime)} · ${place || "Ubicación desconocida"} · ${fileName}`;
+  const activityMeta = ACTIVITY_META[activityType] || { label: "Actividad", emoji: "❓", className: "unknown" };
 
   return (
     <details open className="card session">
       <summary className="session__summary">
-        <span className="session__title">{title}</span>
+        <div className="session__summaryLeft">
+          <span className="session__title">{title}</span>
+          <span className={`session__activityTag session__activityTag--${activityMeta.className}`}>
+            <span className="session__activityIcon" aria-hidden>{activityMeta.emoji}</span>
+            <span>{activityMeta.label}</span>
+          </span>
+        </div>
         <span className="session__chev">▼</span>
       </summary>
 
       <div className="session__content">
         <div className="controls">
+          <div className={`activityCard activityCard--${activityMeta.className}`}>
+            <div className="activityCard__header">Actividad estimada</div>
+            <div className="activityCard__value">{activityMeta.emoji} {activityMeta.label}</div>
+            {activityNote && <p className="activityCard__note">{activityNote}</p>}
+            {stats && (
+              <dl className="activityCard__metrics">
+                <div>
+                  <dt>Distancia total</dt>
+                  <dd>{formatKilometers(stats.totalDistanceKm)}</dd>
+                </div>
+                <div>
+                  <dt>Duración</dt>
+                  <dd>{formatDuration(stats.totalDurationSec)}</dd>
+                </div>
+                <div>
+                  <dt>Velocidad media</dt>
+                  <dd>{formatSpeed(stats.avgSpeedKmh)}</dd>
+                </div>
+                <div>
+                  <dt>Velocidad máx.</dt>
+                  <dd>{formatSpeed(stats.maxSpeedKmh)}</dd>
+                </div>
+                <div>
+                  <dt>Área recorrida</dt>
+                  <dd>{formatSpan(stats.bboxWidthKm, stats.bboxHeightKm)}</dd>
+                </div>
+              </dl>
+            )}
+          </div>
           <ControlNumber label="Gamma" help="<1 realza intensos, >1 suaviza" min={0.3} max={1.8} step={0.05} value={params.gamma} onChange={(v) => onChangeParams(id, { gamma: v })} />
           <ControlNumber label="Sigma" help="Suavizado (px de la grilla)" min={2} max={30} step={1} value={params.sigma} onChange={(v) => onChangeParams(id, { sigma: v })} />
           <ControlNumber label="Threshold" help="Umbral mínimo visible" min={0} max={0.2} step={0.005} value={params.threshold} onChange={(v) => onChangeParams(id, { threshold: v })} />
@@ -251,6 +317,151 @@ function parseGPX(xmlText) {
 
   const startTime = pts.find((p) => p.time)?.time || doc.getElementsByTagName("time")[0]?.textContent || null;
   return { points: pts, startTime };
+}
+
+function computeTrackStats(points) {
+  if (!points.length) {
+    return {
+      totalDistanceKm: 0,
+      totalDurationSec: 0,
+      avgSpeedKmh: 0,
+      maxSpeedKmh: 0,
+      bboxWidthKm: 0,
+      bboxHeightKm: 0,
+      bboxMaxSpanKm: 0,
+      bboxDiagonalKm: 0,
+      pointCount: 0,
+    };
+  }
+
+  let totalDistanceKm = 0;
+  let maxSpeedKmh = 0;
+  let prevPoint = null;
+  let prevTime = null;
+  const timeSamples = [];
+
+  let minLat = Infinity;
+  let minLon = Infinity;
+  let maxLat = -Infinity;
+  let maxLon = -Infinity;
+
+  for (const point of points) {
+    const timeValue = point.time ? Date.parse(point.time) : NaN;
+    if (Number.isFinite(timeValue)) {
+      timeSamples.push(timeValue);
+    }
+
+    if (prevPoint) {
+      const segmentKm = haversineDistance(prevPoint.lat, prevPoint.lon, point.lat, point.lon);
+      totalDistanceKm += segmentKm;
+
+      if (Number.isFinite(timeValue) && Number.isFinite(prevTime)) {
+        const dtHours = (timeValue - prevTime) / 3_600_000;
+        if (dtHours > 0) {
+          const speed = segmentKm / dtHours;
+          if (speed > maxSpeedKmh) maxSpeedKmh = speed;
+        }
+      }
+    }
+
+    prevPoint = point;
+    prevTime = timeValue;
+
+    if (point.lat < minLat) minLat = point.lat;
+    if (point.lat > maxLat) maxLat = point.lat;
+    if (point.lon < minLon) minLon = point.lon;
+    if (point.lon > maxLon) maxLon = point.lon;
+  }
+
+  let totalDurationSec = 0;
+  if (timeSamples.length >= 2) {
+    const sorted = timeSamples.sort((a, b) => a - b);
+    totalDurationSec = Math.max(0, (sorted[sorted.length - 1] - sorted[0]) / 1000);
+  }
+
+  const avgSpeedKmh = totalDurationSec > 0 ? (totalDistanceKm / (totalDurationSec / 3600)) : 0;
+
+  const midLat = (minLat + maxLat) / 2;
+  const midLon = (minLon + maxLon) / 2;
+  const bboxWidthKm = haversineDistance(midLat, minLon, midLat, maxLon);
+  const bboxHeightKm = haversineDistance(minLat, midLon, maxLat, midLon);
+  const bboxDiagonalKm = haversineDistance(minLat, minLon, maxLat, maxLon);
+  const bboxMaxSpanKm = Math.max(bboxWidthKm, bboxHeightKm);
+
+  return {
+    totalDistanceKm,
+    totalDurationSec,
+    avgSpeedKmh,
+    maxSpeedKmh,
+    bboxWidthKm,
+    bboxHeightKm,
+    bboxMaxSpanKm,
+    bboxDiagonalKm,
+    pointCount: points.length,
+  };
+}
+
+/**
+ * Clasifica la actividad con heurísticas simples:
+ * - Fútbol: desplazamiento compacto (bounding box pequeño) y distancia corta.
+ * - Bici: velocidades altas sostenidas o picos máximos elevados.
+ * - Running: ritmos moderados con recorridos acotados.
+ * En caso de duda, se cae en "running" como valor seguro para evitar falsos positivos.
+ */
+function classifyActivity(stats) {
+  const span = stats.bboxMaxSpanKm;
+
+  if (
+    stats.totalDistanceKm <= ACTIVITY_HEURISTICS.futbol.maxDistanceKm &&
+    span <= ACTIVITY_HEURISTICS.futbol.maxSpanKm
+  ) {
+    return "futbol";
+  }
+
+  if (
+    stats.avgSpeedKmh >= ACTIVITY_HEURISTICS.bici.minAvgSpeedKmh ||
+    stats.maxSpeedKmh >= ACTIVITY_HEURISTICS.bici.minMaxSpeedKmh
+  ) {
+    return "bici";
+  }
+
+  if (
+    stats.avgSpeedKmh <= ACTIVITY_HEURISTICS.running.maxAvgSpeedKmh &&
+    span <= ACTIVITY_HEURISTICS.running.maxSpanKm
+  ) {
+    return "running";
+  }
+
+  return "running";
+}
+
+// Etiqueta auxiliar para dejar constancia cuando los datos quedan cerca de los umbrales.
+function deriveClassificationNote(stats, activityType) {
+  const span = stats.bboxMaxSpanKm;
+  if (
+    activityType === "futbol" &&
+    (stats.totalDistanceKm > ACTIVITY_HEURISTICS.futbol.maxDistanceKm * 0.85 ||
+      span > ACTIVITY_HEURISTICS.futbol.maxSpanKm * 0.85)
+  ) {
+    return "Campo reducido detectado; podría ser fútbol u otra práctica corta.";
+  }
+
+  if (
+    activityType === "bici" &&
+    stats.avgSpeedKmh < ACTIVITY_HEURISTICS.bici.minAvgSpeedKmh &&
+    stats.maxSpeedKmh < ACTIVITY_HEURISTICS.bici.minMaxSpeedKmh * 1.1
+  ) {
+    return "Velocidades al límite del umbral; revisar si es ciclismo suave o running rápido.";
+  }
+
+  if (
+    activityType === "running" &&
+    (stats.avgSpeedKmh > ACTIVITY_HEURISTICS.running.maxAvgSpeedKmh || span > ACTIVITY_HEURISTICS.running.maxSpanKm)
+  ) {
+    return "Sin clasificar con certeza (se muestra como running por defecto).";
+  }
+
+  return null;
 }
 
 function centerOfPoints(points) {
@@ -353,6 +564,47 @@ function hexToRgb(hex) { const h = hex.replace("#", ""); return { r: parseInt(h.
 function lerp(a, b, t) { return a + (b - a) * t; }
 function mix(c1, c2, t) { return { r: Math.round(lerp(c1.r, c2.r, t)), g: Math.round(lerp(c1.g, c2.g, t)), b: Math.round(lerp(c1.b, c2.b, t)) }; }
 
+const EARTH_RADIUS_KM = 6371;
+
+function haversineDistance(lat1, lon1, lat2, lon2) {
+  const toRad = (v) => (v * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return EARTH_RADIUS_KM * c;
+}
+
+function formatKilometers(km) {
+  if (!Number.isFinite(km) || km <= 0) return "—";
+  return `${km.toFixed(km < 10 ? 2 : 1)} km`;
+}
+
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "—";
+  const hrs = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  const secs = Math.round(seconds % 60);
+  const parts = [];
+  if (hrs) parts.push(`${hrs}h`);
+  if (mins) parts.push(`${mins}m`);
+  if (!hrs && !mins) parts.push(`${secs}s`);
+  return parts.join(" ") || `${secs}s`;
+}
+
+function formatSpeed(kmh) {
+  if (!Number.isFinite(kmh) || kmh <= 0) return "—";
+  return `${kmh.toFixed(1)} km/h`;
+}
+
+function formatSpan(widthKm, heightKm) {
+  if (!Number.isFinite(widthKm) || !Number.isFinite(heightKm) || (widthKm <= 0 && heightKm <= 0)) return "—";
+  return `${widthKm.toFixed(2)} × ${heightKm.toFixed(2)} km`;
+}
+
 const C_GREEN = hexToRgb("#00A000");
 const C_YELLOW = hexToRgb("#FFFF00");
 const C_ORANGE = hexToRgb("#FFA500");
@@ -376,7 +628,12 @@ function formatDateTime(iso) {
 
 // DEV tests activables con ?devtests=1
 (function maybeRunDevTests() {
-  try { const url = new URL(window.location.href); if (url.searchParams.get("devtests") === "1") runDevTests(); } catch {}
+  try {
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("devtests") === "1") runDevTests();
+  } catch (err) {
+    void err;
+  }
 })();
 
 function runDevTests() {
@@ -402,12 +659,10 @@ function runDevTests() {
     { json: { address: { suburb: "Palermo" } }, expect: "Palermo" },
     { json: null, expect: null },
   ];
-  const placeRes = placeCases.map((c) => ({ input: c.json, output: extractPlaceName(c.json), ok: extractPlaceName(c.json) === c.expect }));
-  // eslint-disable-next-line no-console
-  console.table(results);
-  // eslint-disable-next-line no-console
-  console.table(placeRes);
-}
+    const placeRes = placeCases.map((c) => ({ input: c.json, output: extractPlaceName(c.json), ok: extractPlaceName(c.json) === c.expect }));
+    console.table(results);
+    console.table(placeRes);
+  }
 
 function Style() {
   return (
@@ -430,12 +685,31 @@ function Style() {
       .empty__title{margin:0 0 6px; font-size:16px}
       .empty__hint{margin:0; color:var(--muted); font-size:13px}
       .sessionList{display:flex; flex-direction:column; gap:12px; margin-top:12px}
-      .session__summary{display:flex; align-items:center; justify-content:space-between; cursor:pointer; padding:12px 14px;}
+      .session__summary{display:flex; align-items:center; justify-content:space-between; cursor:pointer; padding:12px 14px; gap:8px}
+      .session__summaryLeft{display:flex; flex-wrap:wrap; align-items:center; gap:8px; min-width:0}
       .session__title{font-weight:600; font-size:14px}
+      .session__activityTag{display:inline-flex; align-items:center; gap:4px; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.03em}
+      .session__activityIcon{font-size:14px}
+      .session__activityTag--running{background:#e0f2fe; color:#0369a1}
+      .session__activityTag--futbol{background:#ecfccb; color:#3f6212}
+      .session__activityTag--bici{background:#fce7f3; color:#a21caf}
+      .session__activityTag--unknown{background:#e5e7eb; color:#374151}
       .session__chev{color:var(--muted)}
       .session__content{display:grid; grid-template-columns: 1fr 1.2fr; gap:12px; padding:12px;}
       @media (max-width:900px){ .session__content{grid-template-columns:1fr} }
       .controls{display:flex; flex-direction:column; gap:10px}
+      .activityCard{border:1px solid var(--line); border-radius:12px; padding:12px; background:#fafafa; display:flex; flex-direction:column; gap:8px}
+      .activityCard__header{font-size:12px; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted); margin:0}
+      .activityCard__value{font-weight:700; font-size:18px}
+      .activityCard--running{background:linear-gradient(135deg, #e0f2fe 0%, #ffffff 60%)}
+      .activityCard--futbol{background:linear-gradient(135deg, #ecfccb 0%, #ffffff 60%)}
+      .activityCard--bici{background:linear-gradient(135deg, #fce7f3 0%, #ffffff 60%)}
+      .activityCard--unknown{background:#f5f5f5}
+      .activityCard__note{margin:0; font-size:12px; color:#7f1d1d}
+      .activityCard__metrics{margin:0; display:grid; gap:6px}
+      .activityCard__metrics div{display:flex; justify-content:space-between; font-size:12px; color:#374151}
+      .activityCard__metrics dt{margin:0; font-weight:600}
+      .activityCard__metrics dd{margin:0; font-variant-numeric:tabular-nums}
       .control{border:1px solid var(--line); border-radius:12px; padding:10px}
       .control__row{display:flex; justify-content:space-between; align-items:center; margin-bottom:4px}
       .control__label{font-weight:600}
