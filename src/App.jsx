@@ -41,7 +41,8 @@ const ACTIVITY_HEURISTICS = {
 
 };
 
-const DEFAULT_SEGMENT_GAP_MINUTES = 8;
+const DEFAULT_SEGMENT_GAP_MINUTES = 5;
+const INACTIVITY_SPEED_THRESHOLD_KMH = 3;
 
 export default function App() {
   const [sessions, setSessions] = useState([]);
@@ -371,7 +372,7 @@ function SessionBlock({ session, onChangeParams, onSelectSegment, onChangeGap, o
             </button>
           </div>
           <ControlNumber
-            label="Corte (min sin puntos)"
+            label="Corte (min inactivo)"
             help="Umbral para detectar cortes largos sin actividad."
             min={1}
             max={60}
@@ -508,32 +509,76 @@ function parseGPX(xmlText) {
 function splitTrack(points, gapMinutes = DEFAULT_SEGMENT_GAP_MINUTES) {
   if (!Array.isArray(points) || points.length === 0) return [];
   const normalizedGap = Number.isFinite(gapMinutes) && gapMinutes > 0 ? gapMinutes : Infinity;
-  const gapMs = normalizedGap * 60_000;
+  const inactivitySeconds = normalizedGap * 60;
   const segments = [];
-  let current = [];
-  let lastTime = null;
 
-  for (const point of points) {
-    const timeValue = point.time ? Date.parse(point.time) : NaN;
-    let shouldSplit = false;
-    if (current.length > 0 && Number.isFinite(timeValue) && Number.isFinite(lastTime)) {
-      if (timeValue < lastTime) {
-        shouldSplit = true;
-      } else if (timeValue - lastTime > gapMs) {
-        shouldSplit = true;
+  let segmentStartIdx = 0;
+  let inactivityStartIdx = null;
+  let inactivityAccumSec = 0;
+  let inactivityQualified = false;
+
+  for (let i = 1; i < points.length; i++) {
+    const prev = points[i - 1];
+    const curr = points[i];
+
+    const prevTime = prev.time ? Date.parse(prev.time) : NaN;
+    const currTime = curr.time ? Date.parse(curr.time) : NaN;
+    const hasTime = Number.isFinite(prevTime) && Number.isFinite(currTime);
+    const deltaSec = hasTime ? (currTime - prevTime) / 1000 : NaN;
+
+    if (!hasTime || !Number.isFinite(deltaSec) || deltaSec <= 0) {
+      if (deltaSec < 0 && i > segmentStartIdx) {
+        const seg = points.slice(segmentStartIdx, i);
+        if (seg.length) segments.push(seg);
+        segmentStartIdx = i;
       }
+      inactivityStartIdx = null;
+      inactivityAccumSec = 0;
+      inactivityQualified = false;
+      continue;
     }
 
-    if (shouldSplit) {
-      segments.push(current);
-      current = [];
-    }
+    const distanceKm = haversineDistance(prev.lat, prev.lon, curr.lat, curr.lon);
+    const deltaHours = deltaSec / 3600;
+    const speedKmh = deltaHours > 0 ? distanceKm / deltaHours : Infinity;
+    const isInactiveStep = speedKmh <= INACTIVITY_SPEED_THRESHOLD_KMH;
 
-    current.push(point);
-    if (Number.isFinite(timeValue)) lastTime = timeValue;
+    if (isInactiveStep) {
+      if (inactivityStartIdx === null) {
+        inactivityStartIdx = i - 1;
+        inactivityAccumSec = deltaSec;
+      } else {
+        inactivityAccumSec += deltaSec;
+      }
+      if (!inactivityQualified && inactivityAccumSec >= inactivitySeconds) {
+        inactivityQualified = true;
+      }
+    } else {
+      if (inactivityQualified && inactivityStartIdx !== null) {
+        const breakStart = inactivityStartIdx;
+        const breakEnd = i;
+        if (breakStart > segmentStartIdx) {
+          const seg = points.slice(segmentStartIdx, breakStart + 1);
+          if (seg.length) segments.push(seg);
+        }
+        segmentStartIdx = breakEnd;
+      }
+      inactivityStartIdx = null;
+      inactivityAccumSec = 0;
+      inactivityQualified = false;
+    }
   }
 
-  if (current.length) segments.push(current);
+  if (inactivityQualified && inactivityStartIdx !== null) {
+    if (inactivityStartIdx > segmentStartIdx) {
+      const seg = points.slice(segmentStartIdx, inactivityStartIdx + 1);
+      if (seg.length) segments.push(seg);
+    }
+  } else if (segmentStartIdx < points.length) {
+    const seg = points.slice(segmentStartIdx);
+    if (seg.length) segments.push(seg);
+  }
+
   return segments.length ? segments : [points];
 }
 
