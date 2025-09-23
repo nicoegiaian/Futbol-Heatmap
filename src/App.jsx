@@ -538,6 +538,18 @@ function splitTrack(points, gapMinutes = DEFAULT_SEGMENT_GAP_MINUTES) {
       continue;
     }
 
+    if (deltaSec >= inactivitySeconds) {
+      if (i > segmentStartIdx) {
+        const seg = points.slice(segmentStartIdx, i);
+        if (seg.length) segments.push(seg);
+      }
+      segmentStartIdx = i;
+      inactivityStartIdx = null;
+      inactivityAccumSec = 0;
+      inactivityQualified = false;
+      continue;
+    }
+
     const distanceKm = haversineDistance(prev.lat, prev.lon, curr.lat, curr.lon);
     const deltaHours = deltaSec / 3600;
     const speedKmh = deltaHours > 0 ? distanceKm / deltaHours : Infinity;
