@@ -42,7 +42,7 @@ const ACTIVITY_HEURISTICS = {
 };
 
 const DEFAULT_SEGMENT_GAP_MINUTES = 5;
-const INACTIVITY_SPEED_THRESHOLD_KMH = 3;
+const INACTIVITY_SPEED_THRESHOLD_KMH = 1;
 
 export default function App() {
   const [sessions, setSessions] = useState([]);
