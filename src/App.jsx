@@ -24,9 +24,21 @@ const ACTIVITY_META = {
 // Heurísticas base para clasificar actividades según el patrón de movimiento.
 // Se documenta explícitamente para poder afinarlas o exponerlas en sliders a futuro.
 const ACTIVITY_HEURISTICS = {
-  futbol: { maxDistanceKm: 5, maxSpanKm: 0.2 },
+  futbol: {
+    maxDistanceKm: 9,
+    maxAvgSpeedKmh: 11,
+    maxSpanKm: 0.35,
+    compactSpanKm: 0.28,
+    maxAreaKm2: 0.08,
+  },
   bici: { minAvgSpeedKmh: 18, minMaxSpeedKmh: 28 },
-  running: { maxAvgSpeedKmh: 12, maxSpanKm: 0.3 },
+  running: {
+    minDistanceKm: 3,
+    maxSpanKm: 3,
+    minAvgSpeedKmh: 7,
+    maxAvgSpeedKmh: 16,
+  },
+
 };
 
 export default function App() {
@@ -220,7 +232,8 @@ function SessionBlock({ session, onChangeParams }) {
                 </div>
                 <div>
                   <dt>Área recorrida</dt>
-                  <dd>{formatSpan(stats.bboxWidthKm, stats.bboxHeightKm)}</dd>
+                  <dd>{formatSpan(stats.trimmedWidthKm || stats.bboxWidthKm, stats.trimmedHeightKm || stats.bboxHeightKm)}</dd>
+
                 </div>
               </dl>
             )}
@@ -330,6 +343,12 @@ function computeTrackStats(points) {
       bboxHeightKm: 0,
       bboxMaxSpanKm: 0,
       bboxDiagonalKm: 0,
+      bboxAreaKm2: 0,
+      trimmedWidthKm: 0,
+      trimmedHeightKm: 0,
+      trimmedMaxSpanKm: 0,
+      trimmedAreaKm2: 0,
+
       pointCount: 0,
     };
   }
@@ -339,6 +358,9 @@ function computeTrackStats(points) {
   let prevPoint = null;
   let prevTime = null;
   const timeSamples = [];
+  const latSamples = [];
+  const lonSamples = [];
+
 
   let minLat = Infinity;
   let minLon = Infinity;
@@ -350,6 +372,10 @@ function computeTrackStats(points) {
     if (Number.isFinite(timeValue)) {
       timeSamples.push(timeValue);
     }
+
+    latSamples.push(point.lat);
+    lonSamples.push(point.lon);
+
 
     if (prevPoint) {
       const segmentKm = haversineDistance(prevPoint.lat, prevPoint.lon, point.lat, point.lon);
@@ -387,6 +413,28 @@ function computeTrackStats(points) {
   const bboxHeightKm = haversineDistance(minLat, midLon, maxLat, midLon);
   const bboxDiagonalKm = haversineDistance(minLat, minLon, maxLat, maxLon);
   const bboxMaxSpanKm = Math.max(bboxWidthKm, bboxHeightKm);
+  const bboxAreaKm2 = bboxWidthKm * bboxHeightKm;
+
+  let trimmedWidthKm = bboxWidthKm;
+  let trimmedHeightKm = bboxHeightKm;
+  let trimmedMaxSpanKm = bboxMaxSpanKm;
+  let trimmedAreaKm2 = bboxAreaKm2;
+
+  if (latSamples.length >= 5 && lonSamples.length >= 5) {
+    const sortedLat = [...latSamples].sort((a, b) => a - b);
+    const sortedLon = [...lonSamples].sort((a, b) => a - b);
+    const latLo = quantile(sortedLat, 0.02);
+    const latHi = quantile(sortedLat, 0.98);
+    const lonLo = quantile(sortedLon, 0.02);
+    const lonHi = quantile(sortedLon, 0.98);
+    const trimMidLat = (latLo + latHi) / 2;
+    const trimMidLon = (lonLo + lonHi) / 2;
+    trimmedWidthKm = haversineDistance(trimMidLat, lonLo, trimMidLat, lonHi);
+    trimmedHeightKm = haversineDistance(latLo, trimMidLon, latHi, trimMidLon);
+    trimmedMaxSpanKm = Math.max(trimmedWidthKm, trimmedHeightKm);
+    trimmedAreaKm2 = trimmedWidthKm * trimmedHeightKm;
+  }
+
 
   return {
     totalDistanceKm,
@@ -397,68 +445,95 @@ function computeTrackStats(points) {
     bboxHeightKm,
     bboxMaxSpanKm,
     bboxDiagonalKm,
+    bboxAreaKm2,
+    trimmedWidthKm,
+    trimmedHeightKm,
+    trimmedMaxSpanKm,
+    trimmedAreaKm2,
+
     pointCount: points.length,
   };
 }
 
 /**
- * Clasifica la actividad con heurísticas simples:
- * - Fútbol: desplazamiento compacto (bounding box pequeño) y distancia corta.
- * - Bici: velocidades altas sostenidas o picos máximos elevados.
- * - Running: ritmos moderados con recorridos acotados.
- * En caso de duda, se cae en "running" como valor seguro para evitar falsos positivos.
+ * Clasifica la actividad ponderando múltiples indicios en lugar de usar un único corte.
+ * Cada disciplina suma puntos según distancia, área cubierta y velocidades típicas.
+ * Se elige la puntuación más alta, privilegiando Fútbol sobre Running en empates
+ * para no degradar partidos compactos como "running".
  */
 function classifyActivity(stats) {
-  const span = stats.bboxMaxSpanKm;
+  const { futbol, bici, running } = ACTIVITY_HEURISTICS;
+  const span = stats.trimmedMaxSpanKm || stats.bboxMaxSpanKm;
+  const area = stats.trimmedAreaKm2 || stats.bboxAreaKm2;
 
-  if (
-    stats.totalDistanceKm <= ACTIVITY_HEURISTICS.futbol.maxDistanceKm &&
-    span <= ACTIVITY_HEURISTICS.futbol.maxSpanKm
-  ) {
-    return "futbol";
+  const scores = { futbol: 0, running: 0, bici: 0 };
+
+  // Bici: velocidades altas o picos importantes.
+  if (stats.avgSpeedKmh >= bici.minAvgSpeedKmh) scores.bici += 3;
+  if (stats.maxSpeedKmh >= bici.minMaxSpeedKmh) scores.bici += 2;
+  if (stats.totalDistanceKm >= running.minDistanceKm * 4) scores.bici += 1; // recorridos largos
+
+  // Fútbol: área compacta, distancias cortas y velocidades contenidas.
+  if (span <= futbol.maxSpanKm) scores.futbol += 1;
+  if (span <= futbol.compactSpanKm) scores.futbol += 2;
+  if (area <= futbol.maxAreaKm2) scores.futbol += 2;
+  if (stats.totalDistanceKm <= futbol.maxDistanceKm) scores.futbol += 2;
+  if (stats.avgSpeedKmh <= futbol.maxAvgSpeedKmh) scores.futbol += 2;
+
+  // Running: distancias medias y ritmos moderados.
+  if (stats.totalDistanceKm >= running.minDistanceKm) scores.running += 1;
+  if (span <= running.maxSpanKm) scores.running += 1;
+  if (stats.avgSpeedKmh >= running.minAvgSpeedKmh && stats.avgSpeedKmh <= running.maxAvgSpeedKmh) {
+    scores.running += 2;
+  } else if (stats.avgSpeedKmh > running.maxAvgSpeedKmh) {
+    scores.bici += 1;
+  } else {
+    scores.futbol += 1;
   }
 
-  if (
-    stats.avgSpeedKmh >= ACTIVITY_HEURISTICS.bici.minAvgSpeedKmh ||
-    stats.maxSpeedKmh >= ACTIVITY_HEURISTICS.bici.minMaxSpeedKmh
-  ) {
-    return "bici";
-  }
+  const ordered = Object.entries(scores).sort((a, b) => {
+    if (b[1] !== a[1]) return b[1] - a[1];
+    const priority = { bici: 3, futbol: 2, running: 1 };
+    return priority[b[0]] - priority[a[0]];
+  });
 
-  if (
-    stats.avgSpeedKmh <= ACTIVITY_HEURISTICS.running.maxAvgSpeedKmh &&
-    span <= ACTIVITY_HEURISTICS.running.maxSpanKm
-  ) {
-    return "running";
-  }
+  const [bestType, bestScore] = ordered[0];
+  return bestScore <= 0 ? "running" : bestType;
 
-  return "running";
 }
 
 // Etiqueta auxiliar para dejar constancia cuando los datos quedan cerca de los umbrales.
 function deriveClassificationNote(stats, activityType) {
-  const span = stats.bboxMaxSpanKm;
-  if (
-    activityType === "futbol" &&
-    (stats.totalDistanceKm > ACTIVITY_HEURISTICS.futbol.maxDistanceKm * 0.85 ||
-      span > ACTIVITY_HEURISTICS.futbol.maxSpanKm * 0.85)
-  ) {
-    return "Campo reducido detectado; podría ser fútbol u otra práctica corta.";
+  const { futbol, bici, running } = ACTIVITY_HEURISTICS;
+  const span = stats.trimmedMaxSpanKm || stats.bboxMaxSpanKm;
+  const area = stats.trimmedAreaKm2 || stats.bboxAreaKm2;
+
+  if (activityType === "futbol") {
+    const nearDistance = stats.totalDistanceKm > futbol.maxDistanceKm * 0.95;
+    const nearSpan = span > futbol.compactSpanKm * 1.1;
+    const nearArea = area > futbol.maxAreaKm2 * 1.15;
+    if (nearDistance || nearSpan || nearArea) {
+      return "Partido compacto detectado, aunque roza los límites típicos de una cancha.";
+    }
+
   }
 
   if (
     activityType === "bici" &&
-    stats.avgSpeedKmh < ACTIVITY_HEURISTICS.bici.minAvgSpeedKmh &&
-    stats.maxSpeedKmh < ACTIVITY_HEURISTICS.bici.minMaxSpeedKmh * 1.1
+    stats.avgSpeedKmh < bici.minAvgSpeedKmh * 1.05 &&
+    stats.maxSpeedKmh < bici.minMaxSpeedKmh * 1.05
   ) {
-    return "Velocidades al límite del umbral; revisar si es ciclismo suave o running rápido.";
+    return "Velocidades justas para bici; revisá si fue running rápido o un tramo en bajada.";
   }
 
-  if (
-    activityType === "running" &&
-    (stats.avgSpeedKmh > ACTIVITY_HEURISTICS.running.maxAvgSpeedKmh || span > ACTIVITY_HEURISTICS.running.maxSpanKm)
-  ) {
-    return "Sin clasificar con certeza (se muestra como running por defecto).";
+  if (activityType === "running") {
+    if (span <= futbol.maxSpanKm * 1.1 && stats.avgSpeedKmh <= running.minAvgSpeedKmh * 0.95) {
+      return "Área y ritmos chicos: podrías etiquetarlo como fútbol recreativo si corresponde.";
+    }
+    if (stats.avgSpeedKmh >= bici.minAvgSpeedKmh * 0.95) {
+      return "Ritmo muy alto; si era bici suave, ajustá los umbrales.";
+    }
+
   }
 
   return null;
@@ -557,6 +632,17 @@ function percentileSampled(arr, p) {
   sample.sort((a, b) => a - b);
   const idx = Math.min(sample.length - 1, Math.max(0, Math.floor(p * (sample.length - 1))));
   return sample[idx] || 0;
+}
+
+function quantile(sortedValues, q) {
+  if (!sortedValues.length) return NaN;
+  const clampedQ = clamp(q, 0, 1);
+  const pos = (sortedValues.length - 1) * clampedQ;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  const next = sortedValues[Math.min(base + 1, sortedValues.length - 1)];
+  const current = sortedValues[base];
+  return current + (next - current) * rest;
 }
 
 function clamp(v, a, b) { return Math.min(b, Math.max(a, v)); }
