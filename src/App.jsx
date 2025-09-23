@@ -15,6 +15,31 @@ import "leaflet/dist/leaflet.css";
  * - Tests DEV activables con `?devtests=1` (sin `import.meta.env`).
  */
 
+const ACTIVITY_META = {
+  running: { label: "Running", emoji: "🏃", className: "running" },
+  futbol: { label: "Fútbol", emoji: "⚽", className: "futbol" },
+  bici: { label: "Bici", emoji: "🚴", className: "bici" },
+};
+
+// Heurísticas base para clasificar actividades según el patrón de movimiento.
+// Se documenta explícitamente para poder afinarlas o exponerlas en sliders a futuro.
+const ACTIVITY_HEURISTICS = {
+  futbol: {
+    maxDistanceKm: 9,
+    maxAvgSpeedKmh: 11,
+    maxSpanKm: 0.35,
+    compactSpanKm: 0.28,
+    maxAreaKm2: 0.08,
+  },
+  bici: { minAvgSpeedKmh: 18, minMaxSpeedKmh: 28 },
+  running: {
+    minDistanceKm: 3,
+    maxSpanKm: 3,
+    minAvgSpeedKmh: 7,
+    maxAvgSpeedKmh: 16,
+  },
+};
+
 export default function App() {
   const [sessions, setSessions] = useState([]);
   const rebuildSeqRef = useRef({}); // id -> seq (invalida cálculos viejos)
@@ -42,6 +67,9 @@ export default function App() {
       if (!parsed.points.length) continue;
 
       const { points, startTime } = parsed;
+      const stats = computeTrackStats(points);
+      const activityType = classifyActivity(stats);
+      const activityNote = deriveClassificationNote(stats, activityType);
       const center = centerOfPoints(points);
       const bounds = boundsOfPoints(points, 0.00045);
 
@@ -50,7 +78,20 @@ export default function App() {
 
       const id = `${file.name}-${Date.now()}`;
       setSessions((prev) => [
-        { id, fileName: file.name, startTime, center, bounds, params, points, overlayUrl, place: "Buscando lugar…" },
+        {
+          id,
+          fileName: file.name,
+          startTime,
+          center,
+          bounds,
+          params,
+          points,
+          overlayUrl,
+          place: "Buscando lugar…",
+          stats,
+          activityType,
+          activityNote,
+        },
         ...prev,
       ]);
 
@@ -147,18 +188,54 @@ function EmptyState() {
 }
 
 function SessionBlock({ session, onChangeParams }) {
-  const { id, fileName, startTime, place, bounds, params, overlayUrl } = session;
+  const { id, fileName, startTime, place, bounds, params, overlayUrl, stats, activityType, activityNote } = session;
   const title = `${formatDateTime(startTime)} · ${place || "Ubicación desconocida"} · ${fileName}`;
+  const activityMeta = ACTIVITY_META[activityType] || { label: "Actividad", emoji: "❓", className: "unknown" };
 
   return (
     <details open className="card session">
       <summary className="session__summary">
-        <span className="session__title">{title}</span>
+        <div className="session__summaryLeft">
+          <span className="session__title">{title}</span>
+          <span className={`session__activityTag session__activityTag--${activityMeta.className}`}>
+            <span className="session__activityIcon" aria-hidden>{activityMeta.emoji}</span>
+            <span>{activityMeta.label}</span>
+          </span>
+        </div>
         <span className="session__chev">▼</span>
       </summary>
 
       <div className="session__content">
         <div className="controls">
+          <div className={`activityCard activityCard--${activityMeta.className}`}>
+            <div className="activityCard__header">Actividad estimada</div>
+            <div className="activityCard__value">{activityMeta.emoji} {activityMeta.label}</div>
+            {activityNote && <p className="activityCard__note">{activityNote}</p>}
+            {stats && (
+              <dl className="activityCard__metrics">
+                <div>
+                  <dt>Distancia total</dt>
+                  <dd>{formatKilometers(stats.totalDistanceKm)}</dd>
+                </div>
+                <div>
+                  <dt>Duración</dt>
+                  <dd>{formatDuration(stats.totalDurationSec)}</dd>
+                </div>
+                <div>
+                  <dt>Velocidad media</dt>
+                  <dd>{formatSpeed(stats.avgSpeedKmh)}</dd>
+                </div>
+                <div>
+                  <dt>Velocidad máx.</dt>
+                  <dd>{formatSpeed(stats.maxSpeedKmh)}</dd>
+                </div>
+                <div>
+                  <dt>Área recorrida</dt>
+                  <dd>{formatSpan(stats.trimmedWidthKm || stats.bboxWidthKm, stats.trimmedHeightKm || stats.bboxHeightKm)}</dd>
+                </div>
+              </dl>
+            )}
+          </div>
           <ControlNumber label="Gamma" help="<1 realza intensos, >1 suaviza" min={0.3} max={1.8} step={0.05} value={params.gamma} onChange={(v) => onChangeParams(id, { gamma: v })} />
           <ControlNumber label="Sigma" help="Suavizado (px de la grilla)" min={2} max={30} step={1} value={params.sigma} onChange={(v) => onChangeParams(id, { sigma: v })} />
           <ControlNumber label="Threshold" help="Umbral mínimo visible" min={0} max={0.2} step={0.005} value={params.threshold} onChange={(v) => onChangeParams(id, { threshold: v })} />
@@ -251,6 +328,205 @@ function parseGPX(xmlText) {
 
   const startTime = pts.find((p) => p.time)?.time || doc.getElementsByTagName("time")[0]?.textContent || null;
   return { points: pts, startTime };
+}
+
+function computeTrackStats(points) {
+  if (!points.length) {
+    return {
+      totalDistanceKm: 0,
+      totalDurationSec: 0,
+      avgSpeedKmh: 0,
+      maxSpeedKmh: 0,
+      bboxWidthKm: 0,
+      bboxHeightKm: 0,
+      bboxMaxSpanKm: 0,
+      bboxDiagonalKm: 0,
+      bboxAreaKm2: 0,
+      trimmedWidthKm: 0,
+      trimmedHeightKm: 0,
+      trimmedMaxSpanKm: 0,
+      trimmedAreaKm2: 0,
+      pointCount: 0,
+    };
+  }
+
+  let totalDistanceKm = 0;
+  let maxSpeedKmh = 0;
+  let prevPoint = null;
+  let prevTime = null;
+  const timeSamples = [];
+  const latSamples = [];
+  const lonSamples = [];
+
+  let minLat = Infinity;
+  let minLon = Infinity;
+  let maxLat = -Infinity;
+  let maxLon = -Infinity;
+
+  for (const point of points) {
+    const timeValue = point.time ? Date.parse(point.time) : NaN;
+    if (Number.isFinite(timeValue)) {
+      timeSamples.push(timeValue);
+    }
+
+    latSamples.push(point.lat);
+    lonSamples.push(point.lon);
+
+    if (prevPoint) {
+      const segmentKm = haversineDistance(prevPoint.lat, prevPoint.lon, point.lat, point.lon);
+      totalDistanceKm += segmentKm;
+
+      if (Number.isFinite(timeValue) && Number.isFinite(prevTime)) {
+        const dtHours = (timeValue - prevTime) / 3_600_000;
+        if (dtHours > 0) {
+          const speed = segmentKm / dtHours;
+          if (speed > maxSpeedKmh) maxSpeedKmh = speed;
+        }
+      }
+    }
+
+    prevPoint = point;
+    prevTime = timeValue;
+
+    if (point.lat < minLat) minLat = point.lat;
+    if (point.lat > maxLat) maxLat = point.lat;
+    if (point.lon < minLon) minLon = point.lon;
+    if (point.lon > maxLon) maxLon = point.lon;
+  }
+
+  let totalDurationSec = 0;
+  if (timeSamples.length >= 2) {
+    const sorted = timeSamples.sort((a, b) => a - b);
+    totalDurationSec = Math.max(0, (sorted[sorted.length - 1] - sorted[0]) / 1000);
+  }
+
+  const avgSpeedKmh = totalDurationSec > 0 ? (totalDistanceKm / (totalDurationSec / 3600)) : 0;
+
+  const midLat = (minLat + maxLat) / 2;
+  const midLon = (minLon + maxLon) / 2;
+  const bboxWidthKm = haversineDistance(midLat, minLon, midLat, maxLon);
+  const bboxHeightKm = haversineDistance(minLat, midLon, maxLat, midLon);
+  const bboxDiagonalKm = haversineDistance(minLat, minLon, maxLat, maxLon);
+  const bboxMaxSpanKm = Math.max(bboxWidthKm, bboxHeightKm);
+  const bboxAreaKm2 = bboxWidthKm * bboxHeightKm;
+
+  let trimmedWidthKm = bboxWidthKm;
+  let trimmedHeightKm = bboxHeightKm;
+  let trimmedMaxSpanKm = bboxMaxSpanKm;
+  let trimmedAreaKm2 = bboxAreaKm2;
+
+  if (latSamples.length >= 5 && lonSamples.length >= 5) {
+    const sortedLat = [...latSamples].sort((a, b) => a - b);
+    const sortedLon = [...lonSamples].sort((a, b) => a - b);
+    const latLo = quantile(sortedLat, 0.02);
+    const latHi = quantile(sortedLat, 0.98);
+    const lonLo = quantile(sortedLon, 0.02);
+    const lonHi = quantile(sortedLon, 0.98);
+    const trimMidLat = (latLo + latHi) / 2;
+    const trimMidLon = (lonLo + lonHi) / 2;
+    trimmedWidthKm = haversineDistance(trimMidLat, lonLo, trimMidLat, lonHi);
+    trimmedHeightKm = haversineDistance(latLo, trimMidLon, latHi, trimMidLon);
+    trimmedMaxSpanKm = Math.max(trimmedWidthKm, trimmedHeightKm);
+    trimmedAreaKm2 = trimmedWidthKm * trimmedHeightKm;
+  }
+
+  return {
+    totalDistanceKm,
+    totalDurationSec,
+    avgSpeedKmh,
+    maxSpeedKmh,
+    bboxWidthKm,
+    bboxHeightKm,
+    bboxMaxSpanKm,
+    bboxDiagonalKm,
+    bboxAreaKm2,
+    trimmedWidthKm,
+    trimmedHeightKm,
+    trimmedMaxSpanKm,
+    trimmedAreaKm2,
+    pointCount: points.length,
+  };
+}
+
+/**
+ * Clasifica la actividad ponderando múltiples indicios en lugar de usar un único corte.
+ * Cada disciplina suma puntos según distancia, área cubierta y velocidades típicas.
+ * Se elige la puntuación más alta, privilegiando Fútbol sobre Running en empates
+ * para no degradar partidos compactos como "running".
+ */
+function classifyActivity(stats) {
+  const { futbol, bici, running } = ACTIVITY_HEURISTICS;
+  const span = stats.trimmedMaxSpanKm || stats.bboxMaxSpanKm;
+  const area = stats.trimmedAreaKm2 || stats.bboxAreaKm2;
+
+  const scores = { futbol: 0, running: 0, bici: 0 };
+
+  // Bici: velocidades altas o picos importantes.
+  if (stats.avgSpeedKmh >= bici.minAvgSpeedKmh) scores.bici += 3;
+  if (stats.maxSpeedKmh >= bici.minMaxSpeedKmh) scores.bici += 2;
+  if (stats.totalDistanceKm >= running.minDistanceKm * 4) scores.bici += 1; // recorridos largos
+
+  // Fútbol: área compacta, distancias cortas y velocidades contenidas.
+  if (span <= futbol.maxSpanKm) scores.futbol += 1;
+  if (span <= futbol.compactSpanKm) scores.futbol += 2;
+  if (area <= futbol.maxAreaKm2) scores.futbol += 2;
+  if (stats.totalDistanceKm <= futbol.maxDistanceKm) scores.futbol += 2;
+  if (stats.avgSpeedKmh <= futbol.maxAvgSpeedKmh) scores.futbol += 2;
+
+  // Running: distancias medias y ritmos moderados.
+  if (stats.totalDistanceKm >= running.minDistanceKm) scores.running += 1;
+  if (span <= running.maxSpanKm) scores.running += 1;
+  if (stats.avgSpeedKmh >= running.minAvgSpeedKmh && stats.avgSpeedKmh <= running.maxAvgSpeedKmh) {
+    scores.running += 2;
+  } else if (stats.avgSpeedKmh > running.maxAvgSpeedKmh) {
+    scores.bici += 1;
+  } else {
+    scores.futbol += 1;
+  }
+
+  const ordered = Object.entries(scores).sort((a, b) => {
+    if (b[1] !== a[1]) return b[1] - a[1];
+    const priority = { bici: 3, futbol: 2, running: 1 };
+    return priority[b[0]] - priority[a[0]];
+  });
+
+  const [bestType, bestScore] = ordered[0];
+  return bestScore <= 0 ? "running" : bestType;
+}
+
+// Etiqueta auxiliar para dejar constancia cuando los datos quedan cerca de los umbrales.
+function deriveClassificationNote(stats, activityType) {
+  const { futbol, bici, running } = ACTIVITY_HEURISTICS;
+  const span = stats.trimmedMaxSpanKm || stats.bboxMaxSpanKm;
+  const area = stats.trimmedAreaKm2 || stats.bboxAreaKm2;
+
+  if (activityType === "futbol") {
+    const nearDistance = stats.totalDistanceKm > futbol.maxDistanceKm * 0.95;
+    const nearSpan = span > futbol.compactSpanKm * 1.1;
+    const nearArea = area > futbol.maxAreaKm2 * 1.15;
+    if (nearDistance || nearSpan || nearArea) {
+      return "Partido compacto detectado, aunque roza los límites típicos de una cancha.";
+    }
+  }
+
+  if (
+    activityType === "bici" &&
+    stats.avgSpeedKmh < bici.minAvgSpeedKmh * 1.05 &&
+    stats.maxSpeedKmh < bici.minMaxSpeedKmh * 1.05
+  ) {
+    return "Velocidades justas para bici; revisá si fue running rápido o un tramo en bajada.";
+  }
+
+  if (activityType === "running") {
+    if (span <= futbol.maxSpanKm * 1.1 && stats.avgSpeedKmh <= running.minAvgSpeedKmh * 0.95) {
+      return "Área y ritmos chicos: podrías etiquetarlo como fútbol recreativo si corresponde.";
+    }
+    if (stats.avgSpeedKmh >= bici.minAvgSpeedKmh * 0.95) {
+      return "Ritmo muy alto; si era bici suave, ajustá los umbrales.";
+    }
+  }
+
+  return null;
 }
 
 function centerOfPoints(points) {
@@ -348,10 +624,62 @@ function percentileSampled(arr, p) {
   return sample[idx] || 0;
 }
 
+function quantile(sortedValues, q) {
+  if (!sortedValues.length) return NaN;
+  const clampedQ = clamp(q, 0, 1);
+  const pos = (sortedValues.length - 1) * clampedQ;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  const next = sortedValues[Math.min(base + 1, sortedValues.length - 1)];
+  const current = sortedValues[base];
+  return current + (next - current) * rest;
+}
+
 function clamp(v, a, b) { return Math.min(b, Math.max(a, v)); }
 function hexToRgb(hex) { const h = hex.replace("#", ""); return { r: parseInt(h.slice(0,2),16), g: parseInt(h.slice(2,4),16), b: parseInt(h.slice(4,6),16) }; }
 function lerp(a, b, t) { return a + (b - a) * t; }
 function mix(c1, c2, t) { return { r: Math.round(lerp(c1.r, c2.r, t)), g: Math.round(lerp(c1.g, c2.g, t)), b: Math.round(lerp(c1.b, c2.b, t)) }; }
+
+const EARTH_RADIUS_KM = 6371;
+
+function haversineDistance(lat1, lon1, lat2, lon2) {
+  const toRad = (v) => (v * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return EARTH_RADIUS_KM * c;
+}
+
+function formatKilometers(km) {
+  if (!Number.isFinite(km) || km <= 0) return "—";
+  return `${km.toFixed(km < 10 ? 2 : 1)} km`;
+}
+
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "—";
+  const hrs = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  const secs = Math.round(seconds % 60);
+  const parts = [];
+  if (hrs) parts.push(`${hrs}h`);
+  if (mins) parts.push(`${mins}m`);
+  if (!hrs && !mins) parts.push(`${secs}s`);
+  return parts.join(" ") || `${secs}s`;
+}
+
+function formatSpeed(kmh) {
+  if (!Number.isFinite(kmh) || kmh <= 0) return "—";
+  return `${kmh.toFixed(1)} km/h`;
+}
+
+function formatSpan(widthKm, heightKm) {
+  if (!Number.isFinite(widthKm) || !Number.isFinite(heightKm) || (widthKm <= 0 && heightKm <= 0)) return "—";
+  return `${widthKm.toFixed(2)} × ${heightKm.toFixed(2)} km`;
+}
 
 const C_GREEN = hexToRgb("#00A000");
 const C_YELLOW = hexToRgb("#FFFF00");
@@ -376,7 +704,12 @@ function formatDateTime(iso) {
 
 // DEV tests activables con ?devtests=1
 (function maybeRunDevTests() {
-  try { const url = new URL(window.location.href); if (url.searchParams.get("devtests") === "1") runDevTests(); } catch {}
+  try {
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("devtests") === "1") runDevTests();
+  } catch (err) {
+    void err;
+  }
 })();
 
 function runDevTests() {
@@ -402,12 +735,10 @@ function runDevTests() {
     { json: { address: { suburb: "Palermo" } }, expect: "Palermo" },
     { json: null, expect: null },
   ];
-  const placeRes = placeCases.map((c) => ({ input: c.json, output: extractPlaceName(c.json), ok: extractPlaceName(c.json) === c.expect }));
-  // eslint-disable-next-line no-console
-  console.table(results);
-  // eslint-disable-next-line no-console
-  console.table(placeRes);
-}
+    const placeRes = placeCases.map((c) => ({ input: c.json, output: extractPlaceName(c.json), ok: extractPlaceName(c.json) === c.expect }));
+    console.table(results);
+    console.table(placeRes);
+  }
 
 function Style() {
   return (
@@ -430,12 +761,31 @@ function Style() {
       .empty__title{margin:0 0 6px; font-size:16px}
       .empty__hint{margin:0; color:var(--muted); font-size:13px}
       .sessionList{display:flex; flex-direction:column; gap:12px; margin-top:12px}
-      .session__summary{display:flex; align-items:center; justify-content:space-between; cursor:pointer; padding:12px 14px;}
+      .session__summary{display:flex; align-items:center; justify-content:space-between; cursor:pointer; padding:12px 14px; gap:8px}
+      .session__summaryLeft{display:flex; flex-wrap:wrap; align-items:center; gap:8px; min-width:0}
       .session__title{font-weight:600; font-size:14px}
+      .session__activityTag{display:inline-flex; align-items:center; gap:4px; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.03em}
+      .session__activityIcon{font-size:14px}
+      .session__activityTag--running{background:#e0f2fe; color:#0369a1}
+      .session__activityTag--futbol{background:#ecfccb; color:#3f6212}
+      .session__activityTag--bici{background:#fce7f3; color:#a21caf}
+      .session__activityTag--unknown{background:#e5e7eb; color:#374151}
       .session__chev{color:var(--muted)}
       .session__content{display:grid; grid-template-columns: 1fr 1.2fr; gap:12px; padding:12px;}
       @media (max-width:900px){ .session__content{grid-template-columns:1fr} }
       .controls{display:flex; flex-direction:column; gap:10px}
+      .activityCard{border:1px solid var(--line); border-radius:12px; padding:12px; background:#fafafa; display:flex; flex-direction:column; gap:8px}
+      .activityCard__header{font-size:12px; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted); margin:0}
+      .activityCard__value{font-weight:700; font-size:18px}
+      .activityCard--running{background:linear-gradient(135deg, #e0f2fe 0%, #ffffff 60%)}
+      .activityCard--futbol{background:linear-gradient(135deg, #ecfccb 0%, #ffffff 60%)}
+      .activityCard--bici{background:linear-gradient(135deg, #fce7f3 0%, #ffffff 60%)}
+      .activityCard--unknown{background:#f5f5f5}
+      .activityCard__note{margin:0; font-size:12px; color:#7f1d1d}
+      .activityCard__metrics{margin:0; display:grid; gap:6px}
+      .activityCard__metrics div{display:flex; justify-content:space-between; font-size:12px; color:#374151}
+      .activityCard__metrics dt{margin:0; font-weight:600}
+      .activityCard__metrics dd{margin:0; font-variant-numeric:tabular-nums}
       .control{border:1px solid var(--line); border-radius:12px; padding:10px}
       .control__row{display:flex; justify-content:space-between; align-items:center; margin-bottom:4px}
       .control__label{font-weight:600}
