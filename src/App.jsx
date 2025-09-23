@@ -38,6 +38,7 @@ const ACTIVITY_HEURISTICS = {
     minAvgSpeedKmh: 7,
     maxAvgSpeedKmh: 16,
   },
+
 };
 
 export default function App() {
@@ -232,6 +233,7 @@ function SessionBlock({ session, onChangeParams }) {
                 <div>
                   <dt>Área recorrida</dt>
                   <dd>{formatSpan(stats.trimmedWidthKm || stats.bboxWidthKm, stats.trimmedHeightKm || stats.bboxHeightKm)}</dd>
+
                 </div>
               </dl>
             )}
@@ -346,6 +348,7 @@ function computeTrackStats(points) {
       trimmedHeightKm: 0,
       trimmedMaxSpanKm: 0,
       trimmedAreaKm2: 0,
+
       pointCount: 0,
     };
   }
@@ -357,6 +360,7 @@ function computeTrackStats(points) {
   const timeSamples = [];
   const latSamples = [];
   const lonSamples = [];
+
 
   let minLat = Infinity;
   let minLon = Infinity;
@@ -371,6 +375,7 @@ function computeTrackStats(points) {
 
     latSamples.push(point.lat);
     lonSamples.push(point.lon);
+
 
     if (prevPoint) {
       const segmentKm = haversineDistance(prevPoint.lat, prevPoint.lon, point.lat, point.lon);
@@ -430,6 +435,7 @@ function computeTrackStats(points) {
     trimmedAreaKm2 = trimmedWidthKm * trimmedHeightKm;
   }
 
+
   return {
     totalDistanceKm,
     totalDurationSec,
@@ -444,6 +450,7 @@ function computeTrackStats(points) {
     trimmedHeightKm,
     trimmedMaxSpanKm,
     trimmedAreaKm2,
+
     pointCount: points.length,
   };
 }
@@ -492,6 +499,7 @@ function classifyActivity(stats) {
 
   const [bestType, bestScore] = ordered[0];
   return bestScore <= 0 ? "running" : bestType;
+
 }
 
 // Etiqueta auxiliar para dejar constancia cuando los datos quedan cerca de los umbrales.
@@ -507,6 +515,7 @@ function deriveClassificationNote(stats, activityType) {
     if (nearDistance || nearSpan || nearArea) {
       return "Partido compacto detectado, aunque roza los límites típicos de una cancha.";
     }
+
   }
 
   if (
@@ -524,6 +533,7 @@ function deriveClassificationNote(stats, activityType) {
     if (stats.avgSpeedKmh >= bici.minAvgSpeedKmh * 0.95) {
       return "Ritmo muy alto; si era bici suave, ajustá los umbrales.";
     }
+
   }
 
   return null;
