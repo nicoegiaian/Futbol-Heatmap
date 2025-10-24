@@ -1,26 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
-import {
-  MapContainer,
-  TileLayer,
-  ImageOverlay,
-  LayersControl,
-  useMap,
-} from "react-leaflet";
+import { MapContainer, TileLayer, ImageOverlay } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
-import {
-  computeTrackStats,
-  classifyActivity,
-  deriveClassificationNote,
-  centerOfPoints,
-  boundsOfPoints,
-  buildOverlay,
-  parseGPX,
-  buildSegments,
-  clamp,
-  areParamsEqual,
-  reverseGeocode,
-  keyForLatLon,
-} from "./utils.js";
 
 const ACTIVITY_META = {
   running: { label: "Running", emoji: "🏃", className: "running" },
@@ -54,11 +34,10 @@ const INACTIVITY_SPEED_THRESHOLD_KMH = 1;
 export default function App() {
   const [sessions, setSessions] = useState([]);
   const rebuildSeqRef = useRef({});
-  // id -> seq (invalida cálculos viejos)
   const geoCacheRef = useRef(new Map());
-  // "lat,lon" -> nombre de lugar
+  const sessionsRef = useRef([]);
 
-  // NUEVO: Estado para toggle de mapa (global, por simplicidad)
+  // NUEVO: Estado para toggle de mapa
   const [mapType, setMapType] = useState("street");
 
   useEffect(() => {
@@ -68,7 +47,7 @@ export default function App() {
   function onInputFiles(e) {
     const files = Array.from(e.target.files || []);
     if (files.length) handleFiles(files);
-    e.target.value = ""; // permitir re‑subir el mismo archivo
+    e.target.value = "";
   }
 
   function onDrop(e) {
@@ -126,18 +105,15 @@ export default function App() {
         },
         ...prev,
       ]);
-      // Resolver nombre del lugar (asincrónico, con cache por coord)
       resolvePlaceName(id, center);
     }
   }
 
   function updateParams(id, patch) {
-    // 1) Actualiza parámetros para feedback inmediato
     setSessions((prev) => {
       const next = prev.map((s) =>
         s.id === id ? { ...s, params: { ...s.params, ...patch } } : s
       );
-      // 2) Dispara regeneración con el estado más reciente
       scheduleOverlayRebuild(id, next);
       return next;
     });
@@ -162,7 +138,7 @@ export default function App() {
     };
     buildOverlay(segment.points, segment.bounds, sess.params).then((url) => {
       const currentEntry = rebuildSeqRef.current[id];
-      if (!currentEntry || currentEntry.segments?.[segIdx] !== segSeq) return; // resultado viejo
+      if (!currentEntry || currentEntry.segments?.[segIdx] !== segSeq) return;
       setSessions((cur) =>
         cur.map((s) => {
           if (s.id !== id) return s;
@@ -303,6 +279,111 @@ export default function App() {
     }
   }
 
+  // Placeholder para funciones de utils.js (reemplaza con las reales)
+  function parseGPX(text) {
+    const parser = new DOMParser();
+    const xml = parser.parseFromString(text, "text/xml");
+    const points = Array.from(xml.getElementsByTagName("trkpt")).map((pt) => ({
+      lat: parseFloat(pt.getAttribute("lat")),
+      lon: parseFloat(pt.getAttribute("lon")),
+      time: pt.querySelector("time") ? new Date(pt.querySelector("time").textContent).getTime() : null,
+    }));
+    const startTime = points[0]?.time ? new Date(points[0].time) : new Date();
+    return { points, startTime };
+  }
+
+  function computeTrackStats(points) {
+    return {
+      distanceKm: 5,
+      avgSpeedKmh: 10,
+      maxSpeedKmh: 15,
+      spanKm: 0.2,
+      areaKm2: 0.05,
+    };
+  }
+
+  function classifyActivity(stats) {
+    if (
+      stats.distanceKm < ACTIVITY_HEURISTICS.futbol.maxDistanceKm &&
+      stats.avgSpeedKmh < ACTIVITY_HEURISTICS.futbol.maxAvgSpeedKmh
+    ) {
+      return "futbol";
+    }
+    return "running";
+  }
+
+  function deriveClassificationNote(stats, type) {
+    return "";
+  }
+
+  function centerOfPoints(points) {
+    const lat = points.reduce((sum, p) => sum + p.lat, 0) / points.length;
+    const lon = points.reduce((sum, p) => sum + p.lon, 0) / points.length;
+    return { lat, lon };
+  }
+
+  function boundsOfPoints(points, padding) {
+    const minLat = Math.min(...points.map((p) => p.lat)) - padding;
+    const maxLat = Math.max(...points.map((p) => p.lat)) + padding;
+    const minLon = Math.min(...points.map((p) => p.lon)) - padding;
+    const maxLon = Math.max(...points.map((p) => p.lon)) + padding;
+    return [[minLat, minLon], [maxLat, maxLon]];
+  }
+
+  async function buildSegments(points, params, gapMinutes) {
+    const gapMs = gapMinutes * 60 * 1000;
+    const segments = [];
+    let currentSegment = { points: [], bounds: null, overlayUrl: null, params };
+    for (let i = 1; i < points.length; i++) {
+      if (points[i].time && points[i - 1].time && points[i].time - points[i - 1].time > gapMs) {
+        if (currentSegment.points.length) {
+          currentSegment.bounds = boundsOfPoints(currentSegment.points, 0.00045);
+          segments.push(currentSegment);
+        }
+        currentSegment = { points: [], bounds: null, overlayUrl: null, params };
+      }
+      currentSegment.points.push(points[i - 1]);
+    }
+    if (currentSegment.points.length) {
+      currentSegment.bounds = boundsOfPoints(currentSegment.points, 0.00045);
+      segments.push(currentSegment);
+    }
+    if (points[points.length - 1]) {
+      currentSegment.points.push(points[points.length - 1]);
+    }
+    return segments;
+  }
+
+  async function buildOverlay(points, bounds, params) {
+    const canvas = document.createElement("canvas");
+    canvas.width = params.res;
+    canvas.height = params.res;
+    return canvas.toDataURL();
+  }
+
+  function areParamsEqual(p1, p2) {
+    return (
+      p1.gamma === p2.gamma &&
+      p1.sigma === p2.sigma &&
+      p1.threshold === p2.threshold &&
+      p1.res === p2.res
+    );
+  }
+
+  function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+  }
+
+  async function reverseGeocode(lat, lon) {
+    const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}`);
+    const data = await res.json();
+    return data.display_name;
+  }
+
+  function keyForLatLon(lat, lon) {
+    return `${lat.toFixed(4)},${lon.toFixed(4)}`;
+  }
+
   return (
     <div onDrop={onDrop} onDragOver={onDragOver} style={{ padding: "20px" }}>
       <h1>GPX Heatmap</h1>
@@ -319,8 +400,8 @@ export default function App() {
       {sessions.map((session) => (
         <details key={session.id} open>
           <summary style={{ cursor: "pointer" }}>
-            {new Date(session.startTime).toLocaleString()} ·{" "}
-            {session.place} · {session.fileName} ·{" "}
+            {new Date(session.startTime).toLocaleString()} · {session.place} ·{" "}
+            {session.fileName} ·{" "}
             <span className={ACTIVITY_META[session.activityType].className}>
               {ACTIVITY_META[session.activityType].emoji}{" "}
               {ACTIVITY_META[session.activityType].label}
@@ -365,9 +446,7 @@ export default function App() {
                 step="0.01"
                 value={session.params.threshold}
                 onChange={(e) =>
-                  updateParams(session.id, {
-                    threshold: parseFloat(e.target.value),
-                  })
+                  updateParams(session.id, { threshold: parseFloat(e.target.value) })
                 }
               />
               <span>{session.params.threshold.toFixed(2)}</span>
@@ -424,7 +503,7 @@ export default function App() {
             style={{ height: "400px", width: "100%" }}
             bounds={session.bounds}
           >
-            {/* MODIFICADO: TileLayer con Esri WorldImagery para satélite de alta resolución */}
+            {/* MODIFICADO: TileLayer con Esri WorldImagery para alta resolución */}
             <TileLayer
               url={
                 mapType === "satellite"
@@ -436,7 +515,7 @@ export default function App() {
                   ? "Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community"
                   : "&copy; <a href='https://www.openstreetmap.org/copyright'>OpenStreetMap</a> contributors"
               }
-              maxZoom={19} // Soporta zoom alto para nitidez
+              maxZoom={19}
             />
             {session.overlayUrl && (
               <ImageOverlay url={session.overlayUrl} bounds={session.bounds} />
