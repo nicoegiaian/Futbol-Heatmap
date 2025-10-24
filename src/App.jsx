@@ -191,13 +191,36 @@ function LeafletMap({ bounds, overlayUrl }) {
     <MapContainer bounds={bounds} scrollWheelZoom style={{ height: 420, width: "100%" }} maxZoom={22}>
       <FitBoundsOnLoad bounds={bounds} />
       <LayersControl position="topright">
-        <LayersControl.BaseLayer checked name="Mapa (OSM)">
+        
+        {/* --- CAPAS BASE (solo puedes elegir una) --- */}
+
+        <LayersControl.BaseLayer name="Mapa (OSM)">
           <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="© OpenStreetMap" maxZoom={22} />
         </LayersControl.BaseLayer>
-        <LayersControl.BaseLayer name="Satélite (Esri)">
-          <TileLayer url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}" attribution="Tiles © Esri" maxZoom={22} />
+        
+        <LayersControl.BaseLayer checked name="Satélite (Esri)">
+          <TileLayer
+            url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+            attribution="Tiles © Esri"
+            maxZoom={22}
+            // Opcional: Esto le dice a Leaflet que no "estire" las fotos
+            // pasadas de este zoom, pero puede que se vea vacío.
+            // maxNativeZoom={19} 
+          />
         </LayersControl.BaseLayer>
+
+        {/* --- SUPERPOSICIONES (puedes tildar/destildar) --- */}
+        
+        <LayersControl.Overlay checked name="Líneas y Referencias (Híbrido)">
+          <TileLayer
+            url="https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"
+            attribution="Labels © Esri"
+            maxZoom={22}
+          />
+        </LayersControl.Overlay>
+
       </LayersControl>
+      
       {overlayUrl && <ImageOverlay url={overlayUrl} bounds={bounds} opacity={1} />}
     </MapContainer>
   );
