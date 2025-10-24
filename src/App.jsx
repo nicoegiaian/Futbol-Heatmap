@@ -247,22 +247,42 @@ function SessionBlock({ session, onChangeParams, onAnalyzeClick }) {
 function AnalysisModal({ session, onClose, onConfirmSegments }) {
   
   const handleConfirm = () => {
+    // Verificar si hay una pausa válida seleccionada
+    if (selectedPauseIdx < 0 || !foundPauses || foundPauses.length === 0) {
+        console.warn("No se seleccionó o encontró una pausa válida.");
+        // Si no hay pausa, igual confirmamos los segmentos (solo tendrá "Actividad Completa")
+        const totalPoints = session.points.length;
+        const segments = [
+          { label: "Actividad Completa", startIdx: 0, endIdx: totalPoints },
+        ];
+        onConfirmSegments(session.id, segments);
+        onClose(); // Cerramos el modal
+        return;
+    }
+
     const selectedPause = foundPauses[selectedPauseIdx];
-    if (!selectedPause) return;
+    const totalPoints = session.points.length; // Usamos longitud de los puntos originales
 
-    const totalPoints = session.points.length; // Usamos .points, no processedPoints
-
-    // Creamos los segmentos basados en los índices
+    // Crear los segmentos de ACTIVIDAD
     const segments = [
+      // Siempre incluir la actividad completa
       { label: "Partido Completo", startIdx: 0, endIdx: totalPoints },
+
+      // Primer Tiempo: Desde el inicio (0) hasta JUSTO ANTES de empezar la pausa (selectedPause.startIdx)
       { label: "Primer Tiempo", startIdx: 0, endIdx: selectedPause.startIdx },
-      { label: "Segundo Tiempo", startIdx: selectedPause.endIdx, endIdx: totalPoints },
+
+      // Segundo Tiempo: Desde JUSTO DESPUÉS de terminar la pausa (selectedPause.endIdx + 1) hasta el final
+      { label: "Segundo Tiempo", startIdx: selectedPause.endIdx + 1, endIdx: totalPoints },
     ];
 
-    // Llamamos a la función del padre (App.jsx)
-    onConfirmSegments(session.id, segments);
+    // Filtrar segmentos que puedan quedar vacíos (si la pausa empieza en 0 o termina al final)
+    const validSegments = segments.filter(seg => seg.endIdx > seg.startIdx);
+
+    // Llamar a la función del componente padre (App) con los segmentos válidos
+    onConfirmSegments(session.id, validSegments);
     onClose(); // Cerramos el modal
   };
+  // --- FIN REEMPLAZO ---
   // Función para formatear segundos a MM:SS
   const formatSeconds = (s) => {
     const mins = Math.floor(s / 60);
@@ -274,40 +294,80 @@ function AnalysisModal({ session, onClose, onConfirmSegments }) {
     const { processedPoints } = session;
     const { speedThreshold, minDuration } = params;
 
+    // Asegurarnos de que tenemos datos para procesar
+    if (!processedPoints || processedPoints.length < 2) {
+        setFoundPauses([]);
+        setSelectedPauseIdx(-1); // Indicar que no hay pausa seleccionada
+        return;
+    }
+
     const pauses = [];
-    let pauseStartIndex = -1;
+    let currentPauseStartIdx = -1; // Índice donde la pausa actual comenzó
 
     for (let i = 0; i < processedPoints.length; i++) {
       const p = processedPoints[i];
+      const isBelowThreshold = p.speed < speedThreshold;
 
-      if (p.speed < speedThreshold) {
-        if (pauseStartIndex === -1) pauseStartIndex = i;
-      } else {
-        if (pauseStartIndex !== -1) {
-          const pauseEndIndex = i;
-          const duration = processedPoints[pauseEndIndex].elapsedSeconds - processedPoints[pauseStartIndex].elapsedSeconds;
-          
-          if (duration >= minDuration) {
-            pauses.push({
-              startIdx: pauseStartIndex,
-              endIdx: pauseEndIndex,
-              startTime: processedPoints[pauseStartIndex].elapsedSeconds,
-              endTime: processedPoints[pauseEndIndex].elapsedSeconds,
-              duration: duration,
-            });
-          }
-          pauseStartIndex = -1;
+      if (isBelowThreshold && currentPauseStartIdx === -1) {
+        // Marcamos el inicio de una posible pausa
+        currentPauseStartIdx = i;
+      } else if (!isBelowThreshold && currentPauseStartIdx !== -1) {
+        // Se detectó movimiento, así que la pausa terminó en el punto ANTERIOR (i - 1)
+        const pauseEndIdx = i - 1; // El índice del ÚLTIMO punto DENTRO de la pausa
+
+        // Asegurarse de que la pausa tuvo al menos un punto
+        if (pauseEndIdx >= currentPauseStartIdx) {
+            const pauseStartPoint = processedPoints[currentPauseStartIdx];
+            const pauseEndPoint = processedPoints[pauseEndIdx]; // Usar el punto final real de la pausa
+
+            const duration = pauseEndPoint.elapsedSeconds - pauseStartPoint.elapsedSeconds;
+
+            if (duration >= minDuration) {
+                // Añadir la pausa si cumple la duración mínima
+                pauses.push({
+                  startIdx: currentPauseStartIdx, // Índice del primer punto de la pausa
+                  endIdx: pauseEndIdx,       // Índice del ÚLTIMO punto de la pausa
+                  startTime: pauseStartPoint.elapsedSeconds,
+                  endTime: pauseEndPoint.elapsedSeconds,
+                  duration: duration,
+                });
+            }
         }
+        // Reseteamos el inicio de pausa porque ya no estamos parados
+        currentPauseStartIdx = -1;
       }
-    }
-    // (Manejar si termina en pausa - omitido por brevedad)
+    } // Fin del bucle for
 
-    // Ordenar por la más larga primero
+    // --- CORRECCIÓN IMPORTANTE: Manejar si la actividad termina EN PAUSA ---
+    if (currentPauseStartIdx !== -1) {
+        const pauseEndIdx = processedPoints.length - 1; // El último punto del track
+
+        if (pauseEndIdx >= currentPauseStartIdx) { // Asegurar que hubo puntos en la pausa
+            const pauseStartPoint = processedPoints[currentPauseStartIdx];
+            const pauseEndPoint = processedPoints[pauseEndIdx];
+            const duration = pauseEndPoint.elapsedSeconds - pauseStartPoint.elapsedSeconds;
+
+            if (duration >= minDuration) {
+                pauses.push({
+                  startIdx: currentPauseStartIdx,
+                  endIdx: pauseEndIdx,
+                  startTime: pauseStartPoint.elapsedSeconds,
+                  endTime: pauseEndPoint.elapsedSeconds,
+                  duration: duration,
+                });
+            }
+        }
+    }
+    // --- FIN CORRECCIÓN ---
+
+    // Ordenar por duración (más larga primero)
     pauses.sort((a, b) => b.duration - a.duration);
 
     setFoundPauses(pauses);
-    setSelectedPauseIdx(0); // Auto-seleccionar la más larga
+    // Seleccionar automáticamente la más larga (índice 0), o -1 si no se encontró ninguna
+    setSelectedPauseIdx(pauses.length > 0 ? 0 : -1);
   };
+  // --- FIN REEMPLAZO ---
 
     // Formatea segundos (p.ej. 300) a "05:00" (min:seg)
     const [params, setParams] = useState({
@@ -315,7 +375,7 @@ function AnalysisModal({ session, onClose, onConfirmSegments }) {
       minDuration: 300,    // segundos (5 min)
     });
     const [foundPauses, setFoundPauses] = useState([]); // Array de pausas encontradas
-    const [selectedPauseIdx, setSelectedPauseIdx] = useState(0); // Índice de la pausa seleccionada
+    const [selectedPauseIdx, setSelectedPauseIdx] = useState(-1); // Índice de la pausa seleccionada
   
     const formatXAxis = (seconds) => {
     const mins = Math.floor(seconds / 60);
