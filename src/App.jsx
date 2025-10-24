@@ -1,6 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import { MapContainer, TileLayer, ImageOverlay, LayersControl, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
+} from 'recharts';
 
 /**
  * GPX Heatmap Web (client‑side only)
@@ -17,6 +20,7 @@ import "leaflet/dist/leaflet.css";
 
 export default function App() {
   const [sessions, setSessions] = useState([]);
+  const [modalSession, setModalSession] = useState(null); 
   const rebuildSeqRef = useRef({}); // id -> seq (invalida cálculos viejos)
   const geoCacheRef = useRef(new Map()); // "lat,lon" -> nombre de lugar
 
@@ -41,6 +45,11 @@ export default function App() {
       const parsed = parseGPX(text);
       if (!parsed.points.length) continue;
 
+      // Procesa los puntos para obtener velocidad y tiempo transcurrido
+      const processedPoints = processGpxPoints(parsed.points); 
+      // Si no se pudieron procesar (ej. no hay info de tiempo), salta el archivo
+      if (!processedPoints.length) continue;
+
       const { points, startTime } = parsed;
       const center = centerOfPoints(points);
       const bounds = boundsOfPoints(points, 0.00045);
@@ -50,7 +59,18 @@ export default function App() {
 
       const id = `${file.name}-${Date.now()}`;
       setSessions((prev) => [
-        { id, fileName: file.name, startTime, center, bounds, params, points, overlayUrl, place: "Buscando lugar…" },
+        { 
+          id, 
+          fileName: file.name, 
+          startTime, 
+          center, 
+          bounds, 
+          params, 
+          points, // Mantenemos los puntos originales
+          processedPoints, // AÑADIMOS los puntos procesados
+          overlayUrl, 
+          place: "Buscando lugar…" 
+        },
         ...prev,
       ]);
 
@@ -129,8 +149,20 @@ export default function App() {
 
         <div className="sessionList">
           {sessions.map((s) => (
-            <SessionBlock key={s.id} session={s} onChangeParams={updateParams} />
+            <SessionBlock 
+            key={s.id} 
+            session={s} 
+            onChangeParams={updateParams} 
+            onAnalyzeClick={setModalSession} 
+          />
           ))}
+
+        {modalSession && (
+          <AnalysisModal 
+            session={modalSession} 
+            onClose={() => setModalSession(null)} 
+          />
+        )}
         </div>
       </main>
     </div>
@@ -146,7 +178,7 @@ function EmptyState() {
   );
 }
 
-function SessionBlock({ session, onChangeParams }) {
+function SessionBlock({ session, onChangeParams, onAnalyzeClick }) {
   const { id, fileName, startTime, place, bounds, params, overlayUrl } = session;
   const title = `${formatDateTime(startTime)} · ${place || "Ubicación desconocida"} · ${fileName}`;
 
@@ -163,6 +195,13 @@ function SessionBlock({ session, onChangeParams }) {
           <ControlNumber label="Sigma" help="Suavizado (px de la grilla)" min={2} max={30} step={1} value={params.sigma} onChange={(v) => onChangeParams(id, { sigma: v })} />
           <ControlNumber label="Threshold" help="Umbral mínimo visible" min={0} max={0.2} step={0.005} value={params.threshold} onChange={(v) => onChangeParams(id, { threshold: v })} />
           <ControlNumber label="Resolución" help="Ancho del raster (px)" min={400} max={1600} step={100} value={params.res} onChange={(v) => onChangeParams(id, { res: Math.round(v) })} />
+          <button 
+            className="btn btn--secondary" 
+            style={{marginTop: 10}}
+            onClick={() => onAnalyzeClick(session)} 
+          >
+            Analizar Actividad
+          </button>
           <p className="help">Consejo: si movés mucho los parámetros, subí la resolución para un borde más suave.</p>
         </div>
         <div className="mapWrap">
@@ -170,6 +209,94 @@ function SessionBlock({ session, onChangeParams }) {
         </div>
       </div>
     </details>
+  );
+}
+
+// ===== NUEVO COMPONENTE MODAL =====
+
+function AnalysisModal({ session, onClose }) {
+  
+  // Formatea segundos (p.ej. 300) a "05:00" (min:seg)
+  const formatXAxis = (seconds) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  };
+
+  // Formatea la velocidad para el tooltip
+  const formatTooltip = (value) => `${value.toFixed(1)} km/h`;
+  
+  // Aquí es donde detectarás las pausas. 
+  // Por ahora, solo mostramos el dato.
+  const findPauses = (points) => {
+    let longPauses = 0;
+    const minPauseDuration = 5 * 60; // 5 minutos en segundos
+
+    for(let i = 1; i < points.length; i++) {
+      const p = points[i];
+      const pPrev = points[i-1];
+      
+      const timeDiff = p.elapsedSeconds - pPrev.elapsedSeconds;
+      
+      // Asumimos una pausa si la velocidad es ~0 Y la última vez fue hace mucho
+      if (p.speed < 1.0 && timeDiff > minPauseDuration) {
+        longPauses++;
+      }
+    }
+    // ESTA LÓGICA ES BÁSICA - habría que mejorarla, 
+    // pero demuestra cómo puedes analizar `processedPoints`
+    return longPauses; 
+  };
+  
+  const pauseCount = findPauses(session.processedPoints);
+
+  return (
+    <div className="modal__overlay" onClick={onClose}>
+      <div className="modal__content" onClick={(e) => e.stopPropagation()}>
+        <div className="modal__header">
+          <h3 className="modal__title">Análisis de Actividad</h3>
+          <button className="modal__close" onClick={onClose}>&times;</button>
+        </div>
+        <div className="modal__body">
+          <p>
+            Gráfico de velocidad (km/h) vs. Tiempo.
+            <br/>
+            Se detectaron <strong>{pauseCount}</strong> posibles pausas largas (lógica simple).
+          </p>
+          <div style={{ width: '100%', height: 300, marginTop: 20 }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart
+                data={session.processedPoints}
+                margin={{ top: 5, right: 20, left: -20, bottom: 5 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis 
+                  dataKey="elapsedSeconds" 
+                  tickFormatter={formatXAxis} 
+                  label={{ value: "Tiempo (min:seg)", position: 'insideBottomRight', offset: -10 }}
+                />
+                <YAxis 
+                  label={{ value: 'Velocidad (km/h)', angle: -90, position: 'insideLeft' }}
+                />
+                <Tooltip 
+                  labelFormatter={formatXAxis} 
+                  formatter={formatTooltip}
+                />
+                <Legend verticalAlign="top" height={36}/>
+                <Line 
+                  type="monotone" 
+                  dataKey="speed" 
+                  name="Velocidad" 
+                  stroke="#8884d8" 
+                  strokeWidth={2}
+                  dot={false} 
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -293,6 +420,61 @@ function boundsOfPoints(points, pad = 0) {
   return [ [minLat - pad, minLon - pad], [maxLat + pad, maxLon + pad] ];
 }
 
+
+/**
+ * Calcula la distancia (en km) entre dos puntos [lat, lon]
+ */
+function haversineDistance(coords1, coords2) {
+  const [lat1, lon1] = coords1;
+  const [lat2, lon2] = coords2;
+  const R = 6371; // Radio de la Tierra en km
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+/**
+ * Procesa puntos GPX crudos para agregar tiempo transcurrido y velocidad
+ */
+function processGpxPoints(points) {
+  if (points.length < 2) return [];
+  
+  const processed = [];
+  const startTime = new Date(points[0].time).getTime();
+
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    const time = new Date(p.time).getTime();
+    const elapsedSeconds = (time - startTime) / 1000;
+
+    if (i === 0) {
+      processed.push({ ...p, elapsedSeconds, speed: 0 });
+      continue;
+    }
+
+    const pPrev = points[i - 1];
+    const timePrev = new Date(pPrev.time).getTime();
+    
+    const dist = haversineDistance([pPrev.lat, pPrev.lon], [p.lat, p.lon]); // km
+    const timeDiffHours = (time - timePrev) / (1000 * 60 * 60); // horas
+
+    // Si el tiempo es 0, la velocidad es 0 (evita / 0)
+    let speed = 0; 
+    if (timeDiffHours > 0) {
+      speed = dist / timeDiffHours; // km/h
+    }
+
+    processed.push({ ...p, elapsedSeconds, speed: isNaN(speed) ? 0 : speed });
+  }
+  return processed;
+}
+
+
 async function buildOverlay(points, bounds, params) {
   const [[minLat, minLon], [maxLat, maxLon]] = bounds;
   const W = params.res || 1000;
@@ -330,7 +512,7 @@ async function buildOverlay(points, bounds, params) {
 
   const p99 = percentileSampled(smooth, 0.99);
   const invP = 1 / (p99 + 1e-9);
-  const gamma = params.gamma || 0.7;
+  const gamma = params.gamma || 1.5;
   const threshold = params.threshold ?? 0.05;
 
   const canvas = document.createElement("canvas");
@@ -467,6 +649,43 @@ function Style() {
       .slider{width:100%}
       .help{color:var(--muted); font-size:12px}
       .mapWrap{border:1px solid var(--line); border-radius:12px; overflow:hidden}
+      .modal__overlay{
+        position: fixed;
+        top: 0; left: 0; right: 0; bottom: 0;
+        background: rgba(0, 0, 0, 0.5);
+        z-index: 1000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 16px;
+      }
+      .modal__content{
+        background: #fff;
+        border-radius: 16px;
+        padding: 20px;
+        max-width: 900px;
+        width: 100%;
+        max-height: 90vh;
+        overflow-y: auto;
+      }
+      .modal__header{
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 12px;
+      }
+      .modal__title{ margin: 0; font-size: 18px; }
+      .modal__close{
+        background: none;
+        border: none;
+        font-size: 28px;
+        cursor: pointer;
+        line-height: 1;
+        padding: 0 4px;
+        color: var(--muted);
+      }
+      .modal__body{ padding-top: 16px; }
     `}</style>
-  );
+    );
 }
