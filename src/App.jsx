@@ -291,11 +291,15 @@ function AnalysisModal({ session, onClose, onConfirmSegments }) {
   };
 
   const handleFindPauses = () => {
+    console.log("handleFindPauses triggered!");
     const { processedPoints } = session;
     const { speedThreshold, minDuration } = params;
 
+    console.log("Params:", { speedThreshold, minDuration });
+    console.log("Total processed points:", processedPoints?.length || 0);
     // Asegurarnos de que tenemos datos para procesar
     if (!processedPoints || processedPoints.length < 2) {
+        console.log("No processed points to analyze.");
         setFoundPauses([]);
         setSelectedPauseIdx(-1); // Indicar que no hay pausa seleccionada
         return;
@@ -359,13 +363,18 @@ function AnalysisModal({ session, onClose, onConfirmSegments }) {
         }
     }
     // --- FIN CORRECCIÓN ---
+    console.log("Raw pauses found:", pauses);
 
     // Ordenar por duración (más larga primero)
     pauses.sort((a, b) => b.duration - a.duration);
 
+    console.log("Sorted pauses:", pauses);
+
     setFoundPauses(pauses);
     // Seleccionar automáticamente la más larga (índice 0), o -1 si no se encontró ninguna
     setSelectedPauseIdx(pauses.length > 0 ? 0 : -1);
+
+    console.log("State update called. Pauses count:", pauses.length);
   };
   // --- FIN REEMPLAZO ---
 
