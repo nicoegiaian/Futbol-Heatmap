@@ -79,6 +79,18 @@ export default function App() {
     }
   }
 
+  function selectSegment(id, segmentIndex) {
+    // 1) Actualiza el índice seleccionado
+    setSessions((prev) => {
+      const next = prev.map((s) => 
+        (s.id === id ? { ...s, selectedSegmentIdx: parseInt(segmentIndex, 10) } : s)
+      );
+      // 2) Dispara la regeneración del heatmap
+      scheduleOverlayRebuild(id, next);
+      return next;
+    });
+  }
+
   function updateParams(id, patch) {
     // 1) Actualiza parámetros para feedback inmediato
     setSessions((prev) => {
@@ -87,6 +99,23 @@ export default function App() {
       scheduleOverlayRebuild(id, next);
       return next;
     });
+  }
+
+  function confirmSegments(id, segments) {
+    setSessions((prev) =>
+      prev.map((s) =>
+        s.id === id
+          ? {
+              ...s,
+              segments: segments, // Reemplaza los segmentos anteriores
+              selectedSegmentIdx: 0, // Resetea al "Partido Completo"
+            }
+          : s
+      )
+    );
+    // Disparamos un rebuild por si acaso, aunque no es estrictamente necesario
+    // hasta que el usuario cambie el dropdown.
+    scheduleOverlayRebuild(id, sessions); 
   }
 
   function scheduleOverlayRebuild(id, nextSessions) {
@@ -161,6 +190,7 @@ export default function App() {
           <AnalysisModal 
             session={modalSession} 
             onClose={() => setModalSession(null)} 
+            onConfirmSegments={confirmSegments} 
           />
         )}
         </div>
@@ -214,10 +244,80 @@ function SessionBlock({ session, onChangeParams, onAnalyzeClick }) {
 
 // ===== NUEVO COMPONENTE MODAL =====
 
-function AnalysisModal({ session, onClose }) {
+function AnalysisModal({ session, onClose, onConfirmSegments }) {
   
-  // Formatea segundos (p.ej. 300) a "05:00" (min:seg)
-  const formatXAxis = (seconds) => {
+  const handleConfirm = () => {
+    const selectedPause = foundPauses[selectedPauseIdx];
+    if (!selectedPause) return;
+
+    const totalPoints = session.points.length; // Usamos .points, no processedPoints
+
+    // Creamos los segmentos basados en los índices
+    const segments = [
+      { label: "Partido Completo", startIdx: 0, endIdx: totalPoints },
+      { label: "Primer Tiempo", startIdx: 0, endIdx: selectedPause.startIdx },
+      { label: "Segundo Tiempo", startIdx: selectedPause.endIdx, endIdx: totalPoints },
+    ];
+
+    // Llamamos a la función del padre (App.jsx)
+    onConfirmSegments(session.id, segments);
+    onClose(); // Cerramos el modal
+  };
+  // Función para formatear segundos a MM:SS
+  const formatSeconds = (s) => {
+    const mins = Math.floor(s / 60);
+    const secs = Math.floor(s % 60);
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  };
+
+  const handleFindPauses = () => {
+    const { processedPoints } = session;
+    const { speedThreshold, minDuration } = params;
+
+    const pauses = [];
+    let pauseStartIndex = -1;
+
+    for (let i = 0; i < processedPoints.length; i++) {
+      const p = processedPoints[i];
+
+      if (p.speed < speedThreshold) {
+        if (pauseStartIndex === -1) pauseStartIndex = i;
+      } else {
+        if (pauseStartIndex !== -1) {
+          const pauseEndIndex = i;
+          const duration = processedPoints[pauseEndIndex].elapsedSeconds - processedPoints[pauseStartIndex].elapsedSeconds;
+          
+          if (duration >= minDuration) {
+            pauses.push({
+              startIdx: pauseStartIndex,
+              endIdx: pauseEndIndex,
+              startTime: processedPoints[pauseStartIndex].elapsedSeconds,
+              endTime: processedPoints[pauseEndIndex].elapsedSeconds,
+              duration: duration,
+            });
+          }
+          pauseStartIndex = -1;
+        }
+      }
+    }
+    // (Manejar si termina en pausa - omitido por brevedad)
+
+    // Ordenar por la más larga primero
+    pauses.sort((a, b) => b.duration - a.duration);
+
+    setFoundPauses(pauses);
+    setSelectedPauseIdx(0); // Auto-seleccionar la más larga
+  };
+
+    // Formatea segundos (p.ej. 300) a "05:00" (min:seg)
+    const [params, setParams] = useState({
+      speedThreshold: 1.5, // km/h
+      minDuration: 300,    // segundos (5 min)
+    });
+    const [foundPauses, setFoundPauses] = useState([]); // Array de pausas encontradas
+    const [selectedPauseIdx, setSelectedPauseIdx] = useState(0); // Índice de la pausa seleccionada
+  
+    const formatXAxis = (seconds) => {
     const mins = Math.floor(seconds / 60);
     const secs = Math.floor(seconds % 60);
     return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
@@ -294,7 +394,77 @@ function AnalysisModal({ session, onClose }) {
               </LineChart>
             </ResponsiveContainer>
           </div>
-        </div>
+          {/* --- NUEVOS CONTROLES INTERACTIVOS --- */}
+          <div className="controls" style={{marginTop: 20, display: 'flex', gap: 16}}>
+            <div className="control" style={{flex: 1}}>
+              <div className="control__row">
+                <span className="control__label">Umbral Velocidad (km/h)</span>
+                <span className="control__value">{params.speedThreshold.toFixed(1)}</span>
+              </div>
+              <input
+                type="range" min={0.5} max={5} step={0.1}
+                value={params.speedThreshold}
+                onChange={(e) => setParams(p => ({ ...p, speedThreshold: parseFloat(e.target.value) }))}
+                className="slider"
+              />
+            </div>
+            <div className="control" style={{flex: 1}}>
+              <div className="control__row">
+                <span className="control__label">Duración Pausa (min)</span>
+                <span className="control__value">{(params.minDuration / 60).toFixed(1)}</span>
+              </div>
+              <input
+                type="range" min={60} max={1200} step={30} // 1 a 20 minutos
+                value={params.minDuration}
+                onChange={(e) => setParams(p => ({ ...p, minDuration: parseInt(e.target.value, 10) }))}
+                className="slider"
+              />
+            </div>
+          </div>
+
+          <button 
+            className="btn" 
+            style={{width: '100%', marginTop: 12}}
+            onClick={handleFindPauses} // <-- ¡Necesitamos crear esta función!
+          >
+            Buscar Pausas Largas
+          </button>
+          {foundPauses.length > 0 && (
+            <div className="pause-results" style={{marginTop: 20}}>
+              <h4>Pausas Encontradas (ordenadas por duración):</h4>
+              <div style={{display: 'flex', flexDirection: 'column', gap: 8}}>
+                {foundPauses.map((pause, idx) => (
+                  <label 
+                    key={idx} 
+                    style={{padding: 8, border: `2px solid ${idx === selectedPauseIdx ? '#111' : 'var(--line)'}`, borderRadius: 8, cursor: 'pointer'}}
+                  >
+                    <input
+                      type="radio"
+                      name="pause-selection"
+                      checked={idx === selectedPauseIdx}
+                      onChange={() => setSelectedPauseIdx(idx)}
+                      style={{marginRight: 8}}
+                    />
+                    <strong>{formatSeconds(pause.duration)} min</strong>
+                    (de {formatSeconds(pause.startTime)} a {formatSeconds(pause.endTime)})
+                  </label>
+                ))}
+              </div>
+              
+              <button 
+                className="btn" 
+                style={{width: '100%', marginTop: 16, background: '#00A000', borderColor: '#00A000'}}
+                onClick={handleConfirm} // <-- ¡Necesitamos crear esta función!
+              >
+                Confirmar Entretiempo y Cerrar
+              </button>
+            </div>
+          )}
+          {foundPauses.length === 0 && (
+            <p style={{textAlign: 'center', marginTop: 12, color: 'var(--muted)'}}>
+              Ajusta los parámetros y pulsa "Buscar"
+            </p>
+          )}        </div>
       </div>
     </div>
   );
