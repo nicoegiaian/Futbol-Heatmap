@@ -290,90 +290,104 @@ function AnalysisModal({ session, onClose, onConfirmSegments }) {
     return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
   };
 
+  // --- REEMPLAZA ESTA FUNCIÓN ---
   const handleFindPauses = () => {
-    console.log("handleFindPauses triggered!");
+    // --- Log 1: Verificar que la función se llama ---
+    console.log("handleFindPauses triggered! (Using AVERAGE SPEED logic)");
+
     const { processedPoints } = session;
     const { speedThreshold, minDuration } = params;
+    const WINDOW_SECONDS = 30; // <-- Ventana para calcular promedio (ej. 30 segundos)
 
-    console.log("Params:", { speedThreshold, minDuration });
+    // --- Log 2: Verificar los parámetros y datos de entrada ---
+    console.log("Params:", { speedThreshold, minDuration, WINDOW_SECONDS });
     console.log("Total processed points:", processedPoints?.length || 0);
-    // Asegurarnos de que tenemos datos para procesar
+
     if (!processedPoints || processedPoints.length < 2) {
-        console.log("No processed points to analyze.");
-        setFoundPauses([]);
-        setSelectedPauseIdx(-1); // Indicar que no hay pausa seleccionada
-        return;
+      console.log("No processed points to analyze.");
+      setFoundPauses([]);
+      setSelectedPauseIdx(-1);
+      return;
     }
 
     const pauses = [];
-    let currentPauseStartIdx = -1; // Índice donde la pausa actual comenzó
+    let currentPauseStartIdx = -1;
+    let windowPoints = []; // Puntos dentro de la ventana deslizante
 
     for (let i = 0; i < processedPoints.length; i++) {
-      const p = processedPoints[i];
-      const isBelowThreshold = p.speed < speedThreshold;
+      const currentPoint = processedPoints[i];
 
-      if (isBelowThreshold && currentPauseStartIdx === -1) {
-        // Marcamos el inicio de una posible pausa
-        currentPauseStartIdx = i;
-      } else if (!isBelowThreshold && currentPauseStartIdx !== -1) {
-        // Se detectó movimiento, así que la pausa terminó en el punto ANTERIOR (i - 1)
-        const pauseEndIdx = i - 1; // El índice del ÚLTIMO punto DENTRO de la pausa
+      // 1. Actualizar la ventana deslizante:
+      // Añadir punto actual
+      windowPoints.push(currentPoint);
+      // Eliminar puntos que ya quedaron fuera de la ventana de tiempo
+      const windowStartTime = currentPoint.elapsedSeconds - WINDOW_SECONDS;
+      windowPoints = windowPoints.filter(p => p.elapsedSeconds >= windowStartTime);
 
-        // Asegurarse de que la pausa tuvo al menos un punto
+      // 2. Calcular velocidad promedio en la ventana:
+      let avgSpeed = 0;
+      if (windowPoints.length > 0) {
+        const sumSpeed = windowPoints.reduce((sum, p) => sum + p.speed, 0);
+        avgSpeed = sumSpeed / windowPoints.length;
+      }
+
+      // 3. Evaluar si estamos en pausa según el promedio:
+      const isPaused = avgSpeed < speedThreshold;
+
+      // --- Lógica de detección de inicio/fin de pausa (similar a antes, pero con 'isPaused') ---
+      if (isPaused && currentPauseStartIdx === -1) {
+        // Marcamos el inicio de una posible pausa (usando el PRIMER punto de la ventana actual)
+        currentPauseStartIdx = processedPoints.findIndex(p => p.elapsedSeconds === windowPoints[0].elapsedSeconds);
+         if (currentPauseStartIdx === -1) currentPauseStartIdx = i; // Fallback por si no lo encuentra exacto
+      } else if (!isPaused && currentPauseStartIdx !== -1) {
+        // La pausa terminó en el punto ANTERIOR (i - 1)
+        const pauseEndIdx = i - 1;
+
         if (pauseEndIdx >= currentPauseStartIdx) {
-            const pauseStartPoint = processedPoints[currentPauseStartIdx];
-            const pauseEndPoint = processedPoints[pauseEndIdx]; // Usar el punto final real de la pausa
+          const pauseStartPoint = processedPoints[currentPauseStartIdx];
+          const pauseEndPoint = processedPoints[pauseEndIdx];
+          const duration = pauseEndPoint.elapsedSeconds - pauseStartPoint.elapsedSeconds;
 
-            const duration = pauseEndPoint.elapsedSeconds - pauseStartPoint.elapsedSeconds;
-
-            if (duration >= minDuration) {
-                // Añadir la pausa si cumple la duración mínima
-                pauses.push({
-                  startIdx: currentPauseStartIdx, // Índice del primer punto de la pausa
-                  endIdx: pauseEndIdx,       // Índice del ÚLTIMO punto de la pausa
-                  startTime: pauseStartPoint.elapsedSeconds,
-                  endTime: pauseEndPoint.elapsedSeconds,
-                  duration: duration,
-                });
-            }
+          if (duration >= minDuration) {
+            pauses.push({
+              startIdx: currentPauseStartIdx,
+              endIdx: pauseEndIdx,
+              startTime: pauseStartPoint.elapsedSeconds,
+              endTime: pauseEndPoint.elapsedSeconds,
+              duration: duration,
+            });
+          }
         }
-        // Reseteamos el inicio de pausa porque ya no estamos parados
-        currentPauseStartIdx = -1;
+        currentPauseStartIdx = -1; // Reseteamos
       }
     } // Fin del bucle for
 
-    // --- CORRECCIÓN IMPORTANTE: Manejar si la actividad termina EN PAUSA ---
+    // Manejar si la actividad termina EN PAUSA (usando la última ventana)
     if (currentPauseStartIdx !== -1) {
-        const pauseEndIdx = processedPoints.length - 1; // El último punto del track
-
-        if (pauseEndIdx >= currentPauseStartIdx) { // Asegurar que hubo puntos en la pausa
+        const pauseEndIdx = processedPoints.length - 1;
+        if (pauseEndIdx >= currentPauseStartIdx) {
             const pauseStartPoint = processedPoints[currentPauseStartIdx];
             const pauseEndPoint = processedPoints[pauseEndIdx];
             const duration = pauseEndPoint.elapsedSeconds - pauseStartPoint.elapsedSeconds;
-
             if (duration >= minDuration) {
-                pauses.push({
-                  startIdx: currentPauseStartIdx,
-                  endIdx: pauseEndIdx,
-                  startTime: pauseStartPoint.elapsedSeconds,
-                  endTime: pauseEndPoint.elapsedSeconds,
-                  duration: duration,
-                });
+                 pauses.push({
+                   startIdx: currentPauseStartIdx,
+                   endIdx: pauseEndIdx,
+                   startTime: pauseStartPoint.elapsedSeconds,
+                   endTime: pauseEndPoint.elapsedSeconds,
+                   duration: duration,
+                 });
             }
         }
     }
-    // --- FIN CORRECCIÓN ---
-    console.log("Raw pauses found:", pauses);
 
-    // Ordenar por duración (más larga primero)
+    // --- Logs para depuración (mantenlos por ahora) ---
+    console.log("Raw pauses found (avg speed):", pauses);
     pauses.sort((a, b) => b.duration - a.duration);
-
-    console.log("Sorted pauses:", pauses);
+    console.log("Sorted pauses (avg speed):", pauses);
 
     setFoundPauses(pauses);
-    // Seleccionar automáticamente la más larga (índice 0), o -1 si no se encontró ninguna
     setSelectedPauseIdx(pauses.length > 0 ? 0 : -1);
-
     console.log("State update called. Pauses count:", pauses.length);
   };
   // --- FIN REEMPLAZO ---
